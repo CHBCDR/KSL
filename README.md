@@ -1,4 +1,4 @@
-旧仓库：https://github.com/CHBCDR/ksu-lkm(已弃用)
+旧仓库：https://github.com/CHBCDR/ksu-lkm     (已弃用)
 
 由DeepSeek V4 Flash编写
 
