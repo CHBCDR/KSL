@@ -51,13 +51,19 @@ jobs:
           echo "=== utsrelease.h after sed ==="
           grep UTS_RELEASE include/generated/utsrelease.h
 
-      - name: Build LKM (ksu_lkm_tp.ko)
+      - name: Build LKM (ksu_lkm_sct.ko, 删 __versions 绕过 MODVERSIONS)
         run: |
           export PATH=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
           make KERNELDIR=$GITHUB_WORKSPACE/kernel ARCH=arm64 \
                CC=clang LD=ld.lld NM=llvm-nm OBJCOPY=llvm-objcopy \
                CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- \
                all
+          # 删 __versions 段 → 内核完全跳过 MODVERSIONS CRC 检查；
+          # vermagic 保留（sed 已对齐 4.14.141+），init_module 严格检查也能过。
+          aarch64-linux-gnu-objcopy --remove-section __versions ksu_lkm_sct.ko ksu_lkm_sct.nov.ko
+          mv -f ksu_lkm_sct.nov.ko ksu_lkm_sct.ko
+          echo "=== sections check (__versions should be gone) ==="
+          aarch64-linux-gnu-readelf -S ksu_lkm_sct.ko | grep -E '__versions' || echo "OK: no __versions section"
 
       - name: Build kload (finit_module loader, arm64 static)
         run: |
