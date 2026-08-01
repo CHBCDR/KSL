@@ -239,7 +239,8 @@ static int make_va_writable(unsigned long addr)
 	tbl[pte_index(addr)] &= ~(3UL << 6); /* AP[2:1] = 00 -> EL1 RW */
 	iounmap(tbl);
 
-	flush_tlb_kernel_page(addr);
+	/* 4.14 arm64 只有 flush_tlb_kernel_range（没有 flush_tlb_kernel_page） */
+	flush_tlb_kernel_range(addr, addr + PAGE_SIZE);
 	printk(KERN_INFO "ksu_sct: PTE patched writable @0x%lx\n", addr);
 	return 1;
 }
