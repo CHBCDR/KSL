@@ -38,25 +38,18 @@ jobs:
           sed -i 's/^#define UTS_RELEASE .*/#define UTS_RELEASE "4.14.141+"/' include/generated/utsrelease.h
           grep UTS_RELEASE include/generated/utsrelease.h
 
-      - name: Build LKM (ksu_lkm_sct.ko, 删 __versions 绕过 MODVERSIONS)
+      - name: Build LKM (ksu_lkm_sct.ko)
         run: |
           export PATH=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
           make KERNELDIR=$GITHUB_WORKSPACE/kernel ARCH=arm64 \
                CC=clang LD=ld.lld NM=llvm-nm OBJCOPY=llvm-objcopy \
                CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- \
                all
-          # 删 __versions 段 → 内核完全跳过 MODVERSIONS CRC 检查；
-          # vermagic 保留（sed 已对齐 4.14.141+），init_module 严格检查也能过。
-          # GNU objcopy 删段会因符号表残留 __versions 符号报错，优先 llvm-objcopy
-          llvm-objcopy --remove-section __versions --strip-symbol __versions \
-            ksu_lkm_sct.ko ksu_lkm_sct.nov.ko 2>/dev/null \
-            || aarch64-linux-gnu-objcopy --remove-section __versions --strip-symbol __versions \
-               ksu_lkm_sct.ko ksu_lkm_sct.nov.ko
-          mv -f ksu_lkm_sct.nov.ko ksu_lkm_sct.ko
-          echo "=== sections check (__versions should be gone) ==="
-          aarch64-linux-gnu-readelf -S ksu_lkm_sct.ko | grep -E '__versions' \
-            && echo "WARN: __versions still present!" \
-            || echo "OK: no __versions section"
+          # 不在这里动 __versions：kload v4 加载时会把该段改名来跳过 CRC
+          echo "=== ko sections (expect __versions present, kload renames at load) ==="
+          aarch64-linux-gnu-readelf -S ksu_lkm_sct.ko | grep -E '__versions|\.modinfo'
+          echo "=== vermagic inside .modinfo ==="
+          aarch64-linux-gnu-objdump -s -j .modinfo ksu_lkm_sct.ko | grep -a vermagic || true
 
       - name: Build kload (finit_module loader, arm64 static)
         run: |
