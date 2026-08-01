@@ -1,0 +1,164 @@
+/*
+ * mock-kernel.h — 本地预检用：模拟 4.14 arm64 内核的关键类型/宏
+ * 目的：在 Windows 上用 clang -fsyntax-only 对 ksu_lkm_*.c 做语法+类型预检，
+ *       抓出 const 限定、类型不匹配、宏缺失等问题，再交付云编译。
+ * 注意：只做编译期检查，不做语义正确性验证。
+ */
+
+#ifndef _MOCK_KERNEL_H
+#define _MOCK_KERNEL_H
+
+#include <stddef.h>
+
+/* ---- 基础类型 ---- */
+typedef unsigned int __u32;
+typedef int __s32;
+typedef __u32 u32;
+typedef __s32 s32;
+typedef unsigned long long u64;
+typedef long long s64;
+typedef unsigned long ulong;
+
+typedef __u32 uid_t;
+typedef __u32 gid_t;
+typedef int pid_t;
+
+/* kuid_t / kgid_t (4.14: struct { uid_t val; }) */
+typedef struct { uid_t val; } kuid_t;
+typedef struct { gid_t val; } kgid_t;
+
+#define KUIDT_INIT(value) ((kuid_t){ value })
+#define KGIDT_INIT(value) ((kgid_t){ value })
+#define GLOBAL_ROOT_UID KUIDT_INIT(0)
+#define GLOBAL_ROOT_GID KGIDT_INIT(0)
+#define current_uid() (current->cred->uid)
+
+/* ---- capabilities (4.14 kernel_cap_t) ---- */
+#define _KERNEL_CAPABILITY_U32S 2
+typedef struct { __u32 cap[_KERNEL_CAPABILITY_U32S]; } kernel_cap_t;
+#define CAP_LAST_U32 ((_KERNEL_CAPABILITY_U32S) - 1)
+#define CAP_LAST_CAP 38
+#define CAP_FULL_SET ((kernel_cap_t) { { [0 ... CAP_LAST_U32] = 0xffffffffUL } })
+
+/* ---- atomic ---- */
+typedef struct { int counter; } atomic_t;
+#define atomic_read(v) ((v)->counter)
+
+/* ---- current ---- */
+struct cred {
+	kuid_t uid, euid, suid, fsuid;
+	kgid_t gid, egid, sgid, fsgid;
+	kernel_cap_t cap_inheritable, cap_permitted, cap_effective, cap_bset, cap_ambient;
+	atomic_t usage;
+};
+struct task_struct {
+	struct cred *cred;
+	pid_t pid;
+};
+extern struct task_struct *current;
+
+/* ---- linux_binprm ---- */
+struct linux_binprm {
+	const char *filename;
+	void *interp;
+};
+
+/* ---- tracepoint (4.14 sched_process_exec, 带 old_pid) ---- */
+struct tracepoint;
+extern int tracepoint_probe_register(struct tracepoint *tp, void *probe, void *data);
+extern int tracepoint_probe_unregister(struct tracepoint *tp, void *probe, void *data);
+extern struct tracepoint __tracepoint_sched_process_exec;
+
+#define DECLARE_TRACE_SCHED_PROCESS_EXEC \
+	static inline int register_trace_sched_process_exec(void (*probe)(void *, struct task_struct *, pid_t, struct linux_binprm *), void *data) \
+	{ return tracepoint_probe_register(&__tracepoint_sched_process_exec, (void *)probe, data); } \
+	static inline int unregister_trace_sched_process_exec(void (*probe)(void *, struct task_struct *, pid_t, struct linux_binprm *), void *data) \
+	{ return tracepoint_probe_unregister(&__tracepoint_sched_process_exec, (void *)probe, data); }
+
+DECLARE_TRACE_SCHED_PROCESS_EXEC
+
+/* ---- module 宏 ---- */
+#define module_init(x)
+#define module_exit(x)
+#define MODULE_LICENSE(x)
+#define MODULE_AUTHOR(x)
+#define MODULE_DESCRIPTION(x)
+#define MODULE_VERSION(x)
+#define MODULE_PARM_DESC(x, y)
+#define __init
+#define __exit
+
+/* module_param(charp) — 源码里已声明变量，这里只需接受宏调用 */
+#define module_param(name, type, perm)
+
+/* printk / KERN_* */
+#define KERN_INFO "6"
+#define KERN_WARNING "4"
+#define KERN_ERR "3"
+#define printk(fmt, ...) (void)0
+
+/* strncmp / strlen */
+#include <string.h>
+#include <errno.h>
+
+/* ftrace 相关 (ksu_lkm_ft.c 用) */
+struct pt_regs {
+	unsigned long regs[31];
+};
+struct ftrace_ops {
+	void (*func)(unsigned long ip, unsigned long parent_ip,
+		     struct ftrace_ops *ops, struct pt_regs *regs);
+	unsigned long flags;
+};
+#define FTRACE_OPS_FL_SAVE_REGS (1 << 0)
+#define FTRACE_OPS_FL_RECURSION_SAFE (1 << 1)
+struct filename {
+	const char *name;
+};
+extern unsigned long kallsyms_lookup_name(const char *name);
+static inline int ftrace_set_filter_ip(struct ftrace_ops *ops, unsigned long ip, int remove, int reset) { return 0; }
+static inline int register_ftrace_function(struct ftrace_ops *ops) { return 0; }
+static inline int unregister_ftrace_function(struct ftrace_ops *ops) { return 0; }
+
+/* prepare_creds / commit_creds */
+extern struct cred *prepare_creds(void);
+extern int commit_creds(struct cred *new);
+
+/* ---- sys_call_table hook 版 (ksu_lkm_sct.c) ---- */
+#define __user
+
+typedef long (*syscall_fn_t)(const struct pt_regs *);
+extern struct cred *prepare_kernel_cred(struct task_struct *daemon);
+extern long strncpy_from_user(char *dst, const char __user *src, long count);
+#define WRITE_ONCE(x, val) ((x) = (val))
+
+/* 页表 mock：只满足语法/类型检查，不校验语义 */
+typedef unsigned long pteval_t;
+typedef unsigned long pmdval_t;
+typedef unsigned long pudval_t;
+typedef unsigned long pgdval_t;
+typedef struct { pteval_t pte; } pte_t;
+typedef struct { pmdval_t pmd; } pmd_t;
+typedef struct { pudval_t pud; } pud_t;
+typedef struct { pgdval_t pgd; } pgd_t;
+
+#define PTE_WRITE (1UL << 7)
+
+extern pgd_t swapper_pg_dir[];
+static inline pgd_t *pgd_offset_k(unsigned long addr) { return &swapper_pg_dir[0]; }
+static inline int pgd_none(pgd_t pgd) { return 0; }
+static inline int pgd_bad(pgd_t pgd) { return 0; }
+static inline pud_t *pud_offset(pgd_t *pgd, unsigned long addr) { return (pud_t *)pgd; }
+static inline int pud_none(pud_t pud) { return 0; }
+static inline int pud_bad(pud_t pud) { return 0; }
+static inline pmd_t *pmd_offset(pud_t *pud, unsigned long addr) { return (pmd_t *)pud; }
+static inline int pmd_none(pmd_t pmd) { return 0; }
+static inline int pmd_bad(pmd_t pmd) { return 0; }
+static inline int pmd_trans_huge(pmd_t pmd) { return 0; }
+static inline int pmd_devmap(pmd_t pmd) { return 0; }
+static inline pte_t *pte_offset_kernel(pmd_t *pmd, unsigned long addr) { return (pte_t *)pmd; }
+static inline int pte_none(pte_t pte) { return 0; }
+static inline unsigned long pmd_val(pmd_t pmd) { return pmd.pmd; }
+static inline unsigned long pte_val(pte_t pte) { return pte.pte; }
+
+#endif /* _MOCK_KERNEL_H */
