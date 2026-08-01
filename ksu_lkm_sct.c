@@ -1,18 +1,21 @@
 /*
- * ksu_lkm_sct.c — KernelSU 提权 LKM（sys_call_table hook 版）v0.4 诊断版
+ * ksu_lkm_sct.c — KernelSU 提权 LKM（sys_call_table hook 版）v0.5
  *
- * v0.4 变更：写文件诊断。本机 dmesg 被 logd 抢食 + wlan 刷屏、logcat kernel
- *   buffer 未接 → 内核日志不可靠。init 每一步和 hook 触发情况直接写
- *   /data/local/tmp/ksu_diag.txt（filp_open + kernel_write），insmod 后
- *   cat 该文件即可看到全部真相。
+ * v0.5 变更：
+ *   1. diag_log 写文件绕开 SELinux append 检查：不用 O_APPEND，改用
+ *      O_WRONLY|O_CREAT + i_size_read(file_inode(f)) 定位文件尾再写。
+ *      （实测 v0.4 的 O_APPEND 被 SELinux 拒，init 的诊断全丢，误以为 init 没跑）
+ *   2. 直接定义 int init_module(void) / void cleanup_module(void)，
+ *      绕开 module_init/module_exit 宏的 alias 机制（clang 9.0.8 下存疑）。
  *
- * v0.3 变更：PTE 补丁（页只读时改 AP 位 + flush TLB + 写回验证）。
+ * v0.4：写文件诊断（/data/local/tmp/ksu_diag.txt，dmesg/logcat 本机不可靠）。
+ * v0.3：PTE 补丁（页只读时改 AP 位 + flush TLB + 写回验证）。
  *
- * 背景：tracepoint 版（ksu_lkm_tp.c）因真机未导出 __tracepoint_sched_process_exec
- *   死路；ftrace 版（ksu_lkm_ft.c）因 CONFIG_FUNCTION_TRACER 未启用死路。
- *   本版只直接引用已导出符号（kallsyms_lookup_name/printk/strncpy_from_user/
- *   param_ops_charp/filp_open/kernel_write），其余 kallsyms_lookup_name 动态解析。
- *   加载用 insmod（init_module）：vermagic 靠 workflow sed 对齐 4.14.141+。
+ * 背景：tracepoint 版（真机未导出 __tracepoint_sched_process_exec）与
+ *   ftrace 版（CONFIG_FUNCTION_TRACER 未启用）均死路。本版只直接引用
+ *   已导出符号（kallsyms_lookup_name/printk/strncpy_from_user/param_ops_charp/
+ *   filp_open/kernel_write），其余 kallsyms_lookup_name 动态解析。
+ *   加载用 insmod（init_module），vermagic 靠 workflow sed 对齐 4.14.141+。
  *
  * MODULE_LICENSE("GPL") 必须：kallsyms_lookup_name 是 EXPORT_SYMBOL_GPL。
  */
@@ -48,7 +51,7 @@ static prepare_kernel_cred_t p_prepare_kernel_cred;
 static commit_creds_t p_commit_creds;
 static syscall_fn_t *sct; /* sys_call_table */
 
-/* ---- 写文件诊断（dmesg/logcat 本机都不可靠） ---- */
+/* ---- 写文件诊断（不用 O_APPEND：SELinux 会拦 append 权限） ---- */
 static void diag_log(const char *fmt, ...)
 {
 	struct file *f;
@@ -57,7 +60,7 @@ static void diag_log(const char *fmt, ...)
 	int n;
 	loff_t pos;
 
-	f = filp_open(DIAG_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
+	f = filp_open(DIAG_FILE, O_WRONLY | O_CREAT, 0644);
 	if (IS_ERR(f))
 		return;
 
@@ -67,7 +70,7 @@ static void diag_log(const char *fmt, ...)
 	if (n > 0) {
 		if (n >= (int)sizeof(buf))
 			n = (int)sizeof(buf) - 1;
-		pos = f->f_pos;
+		pos = i_size_read(file_inode(f)); /* 文件尾，等效 append */
 		kernel_write(f, buf, n, &pos);
 	}
 	filp_close(f, NULL);
@@ -101,7 +104,7 @@ static syscall_fn_t *find_sys_call_table(void)
 	u32 *insn;
 
 	if (!el0) {
-		printk(KERN_ERR "ksu_sct: el0_svc not in kallsyms\n");
+		diag_log("el0_svc not in kallsyms\n");
 		return NULL;
 	}
 
@@ -292,7 +295,7 @@ static long ksu_sys_execve(const struct pt_regs *regs)
 	return orig_sys_execve(regs);
 }
 
-static int __init ksu_sct_init(void)
+static int ksu_sct_init(void)
 {
 	unsigned long se, el0;
 	int r;
@@ -347,7 +350,7 @@ static int __init ksu_sct_init(void)
 	return 0;
 }
 
-static void __exit ksu_sct_exit(void)
+static void ksu_sct_exit(void)
 {
 	if (sct && orig_sys_execve && sct[NR_EXECVE] == ksu_sys_execve)
 		WRITE_ONCE(sct[NR_EXECVE], orig_sys_execve);
@@ -355,10 +358,18 @@ static void __exit ksu_sct_exit(void)
 	printk(KERN_INFO "ksu_sct: unhooked\n");
 }
 
-module_init(ksu_sct_init);
-module_exit(ksu_sct_exit);
+/* 直接提供 modpost 期望的符号，绕开 module_init/module_exit 宏的 alias 机制 */
+int init_module(void)
+{
+	return ksu_sct_init();
+}
+
+void cleanup_module(void)
+{
+	ksu_sct_exit();
+}
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("DS");
 MODULE_DESCRIPTION("KSU root grant via sys_call_table execve hook (4.14 MT6771)");
-MODULE_VERSION("0.4");
+MODULE_VERSION("0.5");
