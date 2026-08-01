@@ -1,5 +1,10 @@
 /*
- * ksu_lkm_sct.c — KernelSU 提权 LKM（sys_call_table hook 版）— 真机可用版
+ * ksu_lkm_sct.c — KernelSU 提权 LKM（sys_call_table hook 版）v0.3
+ *
+ * v0.3 变更：PTE 补丁。真机疑似把 .bss 设只读（实测 hook 未生效、init
+ *   走到 "page is RO, hook disabled" 分支）。现在页不可写时自动遍历页表
+ *   改 PTE 的 AP 位（EL1 RO -> RW）+ flush TLB，然后写 hook，并读回验证。
+ *   同时把页表遍历的每一级条目值都打印出来，便于远程诊断。
  *
  * 背景（为什么不是 tracepoint/ftrace 版）：
  *   1. ksu_lkm_tp.c（tracepoint 版）：真机内核未导出 __tracepoint_sched_process_exec，
@@ -7,24 +12,18 @@
  *   2. ksu_lkm_ft.c（ftrace 版）：真机 CONFIG_FUNCTION_TRACER 未启用，不可行。
  *   3. 本版：hook sys_call_table[__NR_execve]，只直接引用已确认导出的符号
  *      （kallsyms_lookup_name / printk / strncpy_from_user / param_ops_charp），
- *      其余符号全部 kallsyms_lookup_name 动态解析 → 零未知符号依赖，kload
- *      （IGNORE_MODVERSIONS|IGNORE_VERMAGIC）可强制加载。
+ *      其余符号全部 kallsyms_lookup_name 动态解析 → 零未知符号依赖。
+ *      加载用 insmod（init_module）即可：vermagic 靠 workflow sed 对齐
+ *      （4.14.141+），CRC 靠 kload 改名 __versions 跳过（或直接 insmod 也可，
+ *      实测 insmod 能加载）。
  *
  * 原理：
  *   - kallsyms_lookup_name("el0_svc") 拿异常入口，反汇编找 "adrp x27, <page>"
- *     解析出 sys_call_table 地址（KALLSYMS_ALL=n 时数据符号不在 kallsyms，
- *     只能这样拿；记忆：el0_svc @0xffffff88ba283f80 → sct @0xffffff88bb032000）。
+ *     解析出 sys_call_table 地址（KALLSYMS_ALL=n 时数据符号不在 kallsyms）。
  *   - 校验 sct[221] == kallsyms_lookup_name("sys_execve")，地址错就 abort。
- *   - PTE 检查 sys_call_table 所在页可写（.bss 通常 RW；若 RO 则告警禁用，
- *     不 crash，便于排查）。
- *   - 替换 sys_execve 表项：arm64 表项签名是 long (*)(const struct pt_regs *)，
- *     从 regs->regs[0] 拿 filename，白名单前缀命中且非 root →
- *     prepare_kernel_cred(NULL)+commit_creds() 标准提权，再调原 sys_execve。
- *
- * 加载（kload v2 带 flags）：
- *   kload /data/local/tmp/ksu_lkm_sct.ko ksu_path=/data/local/tmp/ksu
- * 测试（注意：shell 本身是 Magisk root，必须用普通用户触发，否则假阳性）：
- *   cp /system/bin/sh /data/local/tmp/ksu && /data/local/tmp/ksu -c id
+ *   - PTE 检查目标页可写；只读则 PTE 补丁（AP[2:1]=00）后写。
+ *   - arm64 表项签名 long (*)(const struct pt_regs *)：regs->regs[0] 是 filename，
+ *     白名单前缀命中且非 root → prepare_kernel_cred(NULL)+commit_creds() 提权。
  *
  * MODULE_LICENSE("GPL") 必须：kallsyms_lookup_name 是 EXPORT_SYMBOL_GPL。
  */
@@ -41,6 +40,7 @@
 #include <linux/mm.h>
 #include <asm/ptrace.h>
 #include <asm/pgtable.h>
+#include <asm/tlbflush.h>
 
 static char *ksu_path = "/data/local/tmp/ksu";
 module_param(ksu_path, charp, 0644);
@@ -118,13 +118,89 @@ static syscall_fn_t *find_sys_call_table(void)
 	return NULL;
 }
 
-/* ---- PTE 可写性检查（手动遍历页表，零数据符号依赖） ----
- * 注意：不能用 pgd_offset_k()（展开引用 init_mm，真机未导出，
- * 加载报 Unknown symbol init_mm）。改为直接读 TTBR1_EL1 拿内核
- * 页表根（物理地址），ioremap_cache 映射页表页再逐级遍历。
- * 真机：CONFIG_ARM64_VA_BITS=39, 4K 页, PGTABLE_LEVELS=3
- * （pgd → pmd → pte，PUD 折叠）。 */
+/* ---- 遍历内核页表（TTBR1_EL1 + ioremap_cache，零数据符号依赖） ----
+ * 返回: 1 = 找到 PTE（*out = 条目值）；0 = huge pmd（*out = pmd 值）；
+ *      -1 = 失败。真机：VA_BITS=39, 4K 页, PGTABLE_LEVELS=3（pgd→pmd→pte）。 */
+static int walk_pte(unsigned long addr, u64 *out)
+{
+	u64 ttbr1, e;
+	u64 *tbl;
+
+	asm volatile("mrs %0, ttbr1_el1" : "=r"(ttbr1));
+
+	tbl = (u64 *)ioremap_cache(ttbr1 & PHYS_MASK, PAGE_SIZE);
+	if (!tbl) {
+		printk(KERN_ERR "ksu_sct: walk pgd ioremap fail\n");
+		return -1;
+	}
+	e = tbl[pgd_index(addr)];
+	iounmap(tbl);
+	if ((e & 3) != 3) {
+		printk(KERN_ERR "ksu_sct: pgd entry bad: 0x%llx\n", e);
+		return -1;
+	}
+
+#if CONFIG_PGTABLE_LEVELS >= 4
+	tbl = (u64 *)ioremap_cache(e & PHYS_MASK, PAGE_SIZE);
+	if (!tbl) {
+		printk(KERN_ERR "ksu_sct: walk pud ioremap fail\n");
+		return -1;
+	}
+	e = tbl[pud_index(addr)];
+	iounmap(tbl);
+	if ((e & 3) != 3) {
+		printk(KERN_ERR "ksu_sct: pud entry bad: 0x%llx\n", e);
+		return -1;
+	}
+#endif
+
+	tbl = (u64 *)ioremap_cache(e & PHYS_MASK, PAGE_SIZE);
+	if (!tbl) {
+		printk(KERN_ERR "ksu_sct: walk pmd ioremap fail\n");
+		return -1;
+	}
+	e = tbl[pmd_index(addr)];
+	iounmap(tbl);
+	if ((e & 3) == 0) {
+		printk(KERN_ERR "ksu_sct: pmd none: 0x%llx\n", e);
+		return -1;
+	}
+	if ((e & 3) == 1) { /* huge block */
+		if (out)
+			*out = e;
+		return 0;
+	}
+
+	tbl = (u64 *)ioremap_cache(e & PHYS_MASK, PAGE_SIZE);
+	if (!tbl) {
+		printk(KERN_ERR "ksu_sct: walk pte ioremap fail\n");
+		return -1;
+	}
+	e = tbl[pte_index(addr)];
+	iounmap(tbl);
+	if ((e & 3) == 0) {
+		printk(KERN_ERR "ksu_sct: pte none: 0x%llx\n", e);
+		return -1;
+	}
+	if (out)
+		*out = e;
+	return 1;
+}
+
 static int va_writable(unsigned long addr)
+{
+	u64 pteval = 0;
+	int r = walk_pte(addr, &pteval);
+
+	if (r == 1)
+		return (pteval & PTE_WRITE) != 0;
+	if (r == 0) /* huge pmd */
+		return (pteval & PTE_WRITE) != 0;
+	return 0;
+}
+
+/* ---- PTE 补丁：把目标页改成 EL1 可写（AP[2:1] = 00）+ flush TLB ---- */
+static int make_va_writable(unsigned long addr)
 {
 	u64 ttbr1, e;
 	u64 *tbl;
@@ -136,7 +212,7 @@ static int va_writable(unsigned long addr)
 		return 0;
 	e = tbl[pgd_index(addr)];
 	iounmap(tbl);
-	if ((e & 3) != 3) /* 必须是 table 条目 */
+	if ((e & 3) != 3)
 		return 0;
 
 #if CONFIG_PGTABLE_LEVELS >= 4
@@ -154,19 +230,18 @@ static int va_writable(unsigned long addr)
 		return 0;
 	e = tbl[pmd_index(addr)];
 	iounmap(tbl);
-	if ((e & 3) == 0)
+	if ((e & 3) != 3) /* huge 不支持（sys_call_table 在 .bss 4K 页，不会 huge） */
 		return 0;
-	if ((e & 3) == 1) /* 大页 block */
-		return (e & PTE_WRITE) != 0;
 
 	tbl = (u64 *)ioremap_cache(e & PHYS_MASK, PAGE_SIZE);
 	if (!tbl)
 		return 0;
-	e = tbl[pte_index(addr)];
+	tbl[pte_index(addr)] &= ~(3UL << 6); /* AP[2:1] = 00 -> EL1 RW */
 	iounmap(tbl);
-	if ((e & 3) == 0)
-		return 0;
-	return (e & PTE_WRITE) != 0;
+
+	flush_tlb_kernel_page(addr);
+	printk(KERN_INFO "ksu_sct: PTE patched writable @0x%lx\n", addr);
+	return 1;
 }
 
 /* ---- hook: arm64 syscall 表项签名 fn(const struct pt_regs *) ---- */
@@ -220,13 +295,24 @@ static int __init ksu_sct_init(void)
 	}
 
 	if (!va_writable((unsigned long)&sct[NR_EXECVE])) {
-		printk(KERN_ERR "ksu_sct: sys_call_table page is RO, hook disabled "
-		       "(sct=%p entry=%p). Need PTE patch.\n",
-		       sct, &sct[NR_EXECVE]);
-		return 0; /* 模块加载成功但不 hook，便于排查 */
+		printk(KERN_WARNING "ksu_sct: page not writable, PTE patch attempt "
+		       "(sct=%p entry=%p)\n", sct, &sct[NR_EXECVE]);
+		if (!make_va_writable((unsigned long)&sct[NR_EXECVE])) {
+			printk(KERN_ERR "ksu_sct: PTE patch failed, hook disabled\n");
+			return 0; /* 加载成功但不 hook，便于远程诊断 */
+		}
+		if (!va_writable((unsigned long)&sct[NR_EXECVE])) {
+			printk(KERN_ERR "ksu_sct: still not writable after patch, "
+			       "hook disabled\n");
+			return 0;
+		}
 	}
 
 	WRITE_ONCE(sct[NR_EXECVE], ksu_sys_execve);
+	if (sct[NR_EXECVE] != ksu_sys_execve) {
+		printk(KERN_ERR "ksu_sct: write verify failed, hook disabled\n");
+		return 0;
+	}
 	printk(KERN_INFO "ksu_sct: sct=%p, execve hooked -> %ps, trigger=%s\n",
 	       sct, ksu_sys_execve, ksu_path);
 	return 0;
@@ -234,8 +320,7 @@ static int __init ksu_sct_init(void)
 
 static void __exit ksu_sct_exit(void)
 {
-	if (sct && orig_sys_execve &&
-	    sct[NR_EXECVE] == ksu_sys_execve)
+	if (sct && orig_sys_execve && sct[NR_EXECVE] == ksu_sys_execve)
 		WRITE_ONCE(sct[NR_EXECVE], orig_sys_execve);
 	printk(KERN_INFO "ksu_sct: unhooked\n");
 }
@@ -246,4 +331,4 @@ module_exit(ksu_sct_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("DS");
 MODULE_DESCRIPTION("KSU root grant via sys_call_table execve hook (4.14 MT6771)");
-MODULE_VERSION("0.2");
+MODULE_VERSION("0.3");

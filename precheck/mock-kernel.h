@@ -132,33 +132,19 @@ extern struct cred *prepare_kernel_cred(struct task_struct *daemon);
 extern long strncpy_from_user(char *dst, const char __user *src, long count);
 #define WRITE_ONCE(x, val) ((x) = (val))
 
-/* 页表 mock：只满足语法/类型检查，不校验语义 */
-typedef unsigned long pteval_t;
-typedef unsigned long pmdval_t;
-typedef unsigned long pudval_t;
-typedef unsigned long pgdval_t;
-typedef struct { pteval_t pte; } pte_t;
-typedef struct { pmdval_t pmd; } pmd_t;
-typedef struct { pudval_t pud; } pud_t;
-typedef struct { pgdval_t pgd; } pgd_t;
-
+/* 页表 mock：手动遍历版（ksu_lkm_sct.c: va_writable，TTBR1+ioremap）*/
+#define CONFIG_PGTABLE_LEVELS 3
+#define PAGE_SHIFT 12
+#define PAGE_SIZE (1UL << PAGE_SHIFT)
+#define PHYS_MASK (~0xFFFUL)
 #define PTE_WRITE (1UL << 7)
-
-extern pgd_t swapper_pg_dir[];
-static inline pgd_t *pgd_offset_k(unsigned long addr) { return &swapper_pg_dir[0]; }
-static inline int pgd_none(pgd_t pgd) { return 0; }
-static inline int pgd_bad(pgd_t pgd) { return 0; }
-static inline pud_t *pud_offset(pgd_t *pgd, unsigned long addr) { return (pud_t *)pgd; }
-static inline int pud_none(pud_t pud) { return 0; }
-static inline int pud_bad(pud_t pud) { return 0; }
-static inline pmd_t *pmd_offset(pud_t *pud, unsigned long addr) { return (pmd_t *)pud; }
-static inline int pmd_none(pmd_t pmd) { return 0; }
-static inline int pmd_bad(pmd_t pmd) { return 0; }
-static inline int pmd_trans_huge(pmd_t pmd) { return 0; }
-static inline int pmd_devmap(pmd_t pmd) { return 0; }
-static inline pte_t *pte_offset_kernel(pmd_t *pmd, unsigned long addr) { return (pte_t *)pmd; }
-static inline int pte_none(pte_t pte) { return 0; }
-static inline unsigned long pmd_val(pmd_t pmd) { return pmd.pmd; }
-static inline unsigned long pte_val(pte_t pte) { return pte.pte; }
+#define __iomem
+#define pgd_index(addr) (((addr) >> 30) & 0x1FF)
+#define pud_index(addr) (((addr) >> 21) & 0x1FF)
+#define pmd_index(addr) (((addr) >> 21) & 0x1FF)
+#define pte_index(addr) (((addr) >> 12) & 0x1FF)
+extern void __iomem *ioremap_cache(unsigned long phys, unsigned long size);
+extern void iounmap(void __iomem *addr);
+#define flush_tlb_kernel_page(addr) ((void)0)
 
 #endif /* _MOCK_KERNEL_H */
