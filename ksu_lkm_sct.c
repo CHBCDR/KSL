@@ -1,21 +1,21 @@
 /*
- * ksu_lkm_sct.c — KernelSU 提权 LKM（sys_call_table hook 版）v0.5
+ * ksu_lkm_sct.c — KernelSU 提权 LKM（sys_call_table hook 版）v0.6
  *
- * v0.5 变更：
- *   1. diag_log 写文件绕开 SELinux append 检查：不用 O_APPEND，改用
- *      O_WRONLY|O_CREAT + i_size_read(file_inode(f)) 定位文件尾再写。
- *      （实测 v0.4 的 O_APPEND 被 SELinux 拒，init 的诊断全丢，误以为 init 没跑）
- *   2. 直接定义 int init_module(void) / void cleanup_module(void)，
- *      绕开 module_init/module_exit 宏的 alias 机制（clang 9.0.8 下存疑）。
+ * v0.6 变更：/sys 参数节点状态标记（diag_state）。
+ *   实测：exit 能写 ksu_diag.txt 而 init 写不进（或 init 未执行），文件诊断
+ *   不可靠。改为 module_param(diag_state, charp, 0444)——init 每走一步就更新
+ *   diag_state 指针，用户 cat /sys/module/ksu_lkm_sct/parameters/diag_state
+ *   即可看到 init 执行进度（0=init 没跑 / 1=在跑 / 5=hooked / 8=提权）。
+ *   零依赖文件权限、dmesg、logcat。
  *
- * v0.4：写文件诊断（/data/local/tmp/ksu_diag.txt，dmesg/logcat 本机不可靠）。
+ * v0.5：直接定义 int init_module(void)（绕开 module_init 宏的 alias 机制）。
+ * v0.4：写文件诊断（/data/local/tmp/ksu_diag.txt）。
  * v0.3：PTE 补丁（页只读时改 AP 位 + flush TLB + 写回验证）。
  *
  * 背景：tracepoint 版（真机未导出 __tracepoint_sched_process_exec）与
  *   ftrace 版（CONFIG_FUNCTION_TRACER 未启用）均死路。本版只直接引用
- *   已导出符号（kallsyms_lookup_name/printk/strncpy_from_user/param_ops_charp/
- *   filp_open/kernel_write），其余 kallsyms_lookup_name 动态解析。
- *   加载用 insmod（init_module），vermagic 靠 workflow sed 对齐 4.14.141+。
+ *   已导出符号，其余 kallsyms_lookup_name 动态解析。加载用 insmod
+ *   （init_module），vermagic 靠 workflow sed 对齐 4.14.141+。
  *
  * MODULE_LICENSE("GPL") 必须：kallsyms_lookup_name 是 EXPORT_SYMBOL_GPL。
  */
@@ -39,6 +39,10 @@ static char *ksu_path = "/data/local/tmp/ksu";
 module_param(ksu_path, charp, 0644);
 MODULE_PARM_DESC(ksu_path, "exec path prefix that triggers root grant");
 
+/* 状态标记：init/hook 每步更新，cat /sys/module/ksu_lkm_sct/parameters/diag_state 查看 */
+static char *diag_state = "0-init-not-run";
+module_param(diag_state, charp, 0444);
+
 #define NR_EXECVE 221 /* arm64 */
 #define DIAG_FILE "/data/local/tmp/ksu_diag.txt"
 
@@ -51,7 +55,7 @@ static prepare_kernel_cred_t p_prepare_kernel_cred;
 static commit_creds_t p_commit_creds;
 static syscall_fn_t *sct; /* sys_call_table */
 
-/* ---- 写文件诊断（不用 O_APPEND：SELinux 会拦 append 权限） ---- */
+/* ---- 写文件诊断（辅助通道，/sys diag_state 为主） ---- */
 static void diag_log(const char *fmt, ...)
 {
 	struct file *f;
@@ -70,7 +74,7 @@ static void diag_log(const char *fmt, ...)
 	if (n > 0) {
 		if (n >= (int)sizeof(buf))
 			n = (int)sizeof(buf) - 1;
-		pos = i_size_read(file_inode(f)); /* 文件尾，等效 append */
+		pos = i_size_read(file_inode(f));
 		kernel_write(f, buf, n, &pos);
 	}
 	filp_close(f, NULL);
@@ -271,6 +275,7 @@ static long ksu_sys_execve(const struct pt_regs *regs)
 
 	if (!diag_once) {
 		diag_once = 1;
+		diag_state = "6-hook-called";
 		diag_log("hook called first time\n");
 	}
 
@@ -281,11 +286,13 @@ static long ksu_sys_execve(const struct pt_regs *regs)
 		    current_uid().val != 0) {
 			struct cred *new;
 
+			diag_state = "7-matched";
 			diag_log("match! pid=%d uid=%d file=%s\n",
 				 current->pid, current_uid().val, buf);
 			new = p_prepare_kernel_cred(NULL);
 			if (new) {
 				p_commit_creds(new);
+				diag_state = "8-root-granted";
 				diag_log("root granted pid=%d\n", current->pid);
 			} else {
 				diag_log("prepare_kernel_cred NULL!\n");
@@ -300,12 +307,16 @@ static int ksu_sct_init(void)
 	unsigned long se, el0;
 	int r;
 
+	diag_state = "1-init-running";
 	diag_log("=== ksu_sct init start ===\n");
 	diag_log("ksu_path=%s\n", ksu_path ? ksu_path : "(null)");
 
 	sct = find_sys_call_table();
-	if (!sct)
+	if (!sct) {
+		diag_state = "2-no-sct";
 		return -ENOENT;
+	}
+	diag_state = "2-sct-found";
 
 	el0 = kallsyms_lookup_name("el0_svc");
 	se = kallsyms_lookup_name("sys_execve");
@@ -316,35 +327,46 @@ static int ksu_sct_init(void)
 	diag_log("kallsyms: el0_svc=%lx sys_execve=%lx ppc=%p cc=%p\n",
 		 el0, se, p_prepare_kernel_cred, p_commit_creds);
 
-	if (!se || !p_prepare_kernel_cred || !p_commit_creds)
+	if (!se || !p_prepare_kernel_cred || !p_commit_creds) {
+		diag_state = "2-kallsyms-fail";
 		return -ENOENT;
+	}
 
 	orig_sys_execve = sct[NR_EXECVE];
 	diag_log("sct=%p sct[%d]=%p\n", sct, NR_EXECVE, orig_sys_execve);
 	if ((unsigned long)orig_sys_execve != se) {
-		diag_log("ABORT: sct[%d] != sys_execve\n", NR_EXECVE);
+		diag_state = "3-sct-mismatch";
 		return -EINVAL;
 	}
+	diag_state = "3-sct-verified";
 
 	r = va_writable((unsigned long)&sct[NR_EXECVE]);
 	diag_log("va_writable=%d\n", r);
 	if (!r) {
+		diag_state = "4-patching";
 		if (!make_va_writable((unsigned long)&sct[NR_EXECVE])) {
+			diag_state = "4-patch-failed";
 			diag_log("PTE patch failed, hook disabled\n");
 			return 0;
 		}
 		if (!va_writable((unsigned long)&sct[NR_EXECVE])) {
+			diag_state = "4-still-ro";
 			diag_log("still not writable after patch\n");
 			return 0;
 		}
+		diag_state = "4-patched";
 		diag_log("PTE patch verified writable\n");
+	} else {
+		diag_state = "4-writable";
 	}
 
 	WRITE_ONCE(sct[NR_EXECVE], ksu_sys_execve);
 	if (sct[NR_EXECVE] != ksu_sys_execve) {
+		diag_state = "4-verify-failed";
 		diag_log("write verify FAILED\n");
 		return 0;
 	}
+	diag_state = "5-hooked";
 	diag_log("HOOK OK: sct[%d] -> %ps, trigger=%s\n",
 		 NR_EXECVE, ksu_sys_execve, ksu_path);
 	return 0;
@@ -354,6 +376,7 @@ static void ksu_sct_exit(void)
 {
 	if (sct && orig_sys_execve && sct[NR_EXECVE] == ksu_sys_execve)
 		WRITE_ONCE(sct[NR_EXECVE], orig_sys_execve);
+	diag_state = "9-exited";
 	diag_log("=== unhooked ===\n");
 	printk(KERN_INFO "ksu_sct: unhooked\n");
 }
@@ -372,4 +395,4 @@ void cleanup_module(void)
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("DS");
 MODULE_DESCRIPTION("KSU root grant via sys_call_table execve hook (4.14 MT6771)");
-MODULE_VERSION("0.5");
+MODULE_VERSION("0.6");
