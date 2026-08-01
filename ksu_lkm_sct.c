@@ -37,6 +37,7 @@
 #include <linux/sched.h>
 #include <linux/capability.h>
 #include <linux/uaccess.h>
+#include <linux/io.h>
 #include <linux/mm.h>
 #include <asm/ptrace.h>
 #include <asm/pgtable.h>
@@ -117,31 +118,55 @@ static syscall_fn_t *find_sys_call_table(void)
 	return NULL;
 }
 
-/* ---- PTE 可写性检查（避免写只读页直接 oops） ---- */
+/* ---- PTE 可写性检查（手动遍历页表，零数据符号依赖） ----
+ * 注意：不能用 pgd_offset_k()（展开引用 init_mm，真机未导出，
+ * 加载报 Unknown symbol init_mm）。改为直接读 TTBR1_EL1 拿内核
+ * 页表根（物理地址），ioremap_cache 映射页表页再逐级遍历。
+ * 真机：CONFIG_ARM64_VA_BITS=39, 4K 页, PGTABLE_LEVELS=3
+ * （pgd → pmd → pte，PUD 折叠）。 */
 static int va_writable(unsigned long addr)
 {
-	pgd_t *pgd;
-	pud_t *pud;
-	pmd_t *pmd;
-	pte_t *pte;
+	u64 ttbr1, e;
+	u64 *tbl;
 
-	pgd = pgd_offset_k(addr);
-	if (pgd_none(*pgd) || pgd_bad(*pgd))
+	asm volatile("mrs %0, ttbr1_el1" : "=r"(ttbr1));
+
+	tbl = (u64 *)ioremap_cache(ttbr1 & PHYS_MASK, PAGE_SIZE);
+	if (!tbl)
 		return 0;
-	pud = pud_offset(pgd, addr);
-	if (pud_none(*pud) || pud_bad(*pud))
+	e = tbl[pgd_index(addr)];
+	iounmap(tbl);
+	if ((e & 3) != 3) /* 必须是 table 条目 */
 		return 0;
-	pmd = pmd_offset(pud, addr);
-	if (pmd_none(*pmd))
+
+#if CONFIG_PGTABLE_LEVELS >= 4
+	tbl = (u64 *)ioremap_cache(e & PHYS_MASK, PAGE_SIZE);
+	if (!tbl)
 		return 0;
-	if (pmd_trans_huge(*pmd) || pmd_devmap(*pmd))
-		return (pmd_val(*pmd) & PTE_WRITE) != 0;
-	if (pmd_bad(*pmd))
+	e = tbl[pud_index(addr)];
+	iounmap(tbl);
+	if ((e & 3) != 3)
 		return 0;
-	pte = pte_offset_kernel(pmd, addr);
-	if (pte_none(*pte))
+#endif
+
+	tbl = (u64 *)ioremap_cache(e & PHYS_MASK, PAGE_SIZE);
+	if (!tbl)
 		return 0;
-	return (pte_val(*pte) & PTE_WRITE) != 0;
+	e = tbl[pmd_index(addr)];
+	iounmap(tbl);
+	if ((e & 3) == 0)
+		return 0;
+	if ((e & 3) == 1) /* 大页 block */
+		return (e & PTE_WRITE) != 0;
+
+	tbl = (u64 *)ioremap_cache(e & PHYS_MASK, PAGE_SIZE);
+	if (!tbl)
+		return 0;
+	e = tbl[pte_index(addr)];
+	iounmap(tbl);
+	if ((e & 3) == 0)
+		return 0;
+	return (e & PTE_WRITE) != 0;
 }
 
 /* ---- hook: arm64 syscall 表项签名 fn(const struct pt_regs *) ---- */
