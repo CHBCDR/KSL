@@ -381,18 +381,13 @@ static void ksu_sct_exit(void)
 	printk(KERN_INFO "ksu_sct: unhooked\n");
 }
 
-/* 直接提供 modpost 期望的符号，绕开 module_init/module_exit 宏的 alias 机制 */
-int init_module(void)
-{
-	return ksu_sct_init();
-}
-
-void cleanup_module(void)
-{
-	ksu_sct_exit();
-}
+/* 用标准 module_init/module_exit 宏：生成 .initcall6.init 段。
+ * 实测直接定义 init_module() 不执行（v0.5/v0.6），怀疑 MTK 内核
+ * 的模块 init 走 initcall 段而非标准 mod->init 路径。 */
+module_init(ksu_sct_init);
+module_exit(ksu_sct_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("DS");
 MODULE_DESCRIPTION("KSU root grant via sys_call_table execve hook (4.14 MT6771)");
-MODULE_VERSION("0.6");
+MODULE_VERSION("0.7");
