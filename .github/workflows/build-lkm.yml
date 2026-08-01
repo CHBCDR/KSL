@@ -1,16 +1,5 @@
 name: Build KSU LKM
 
-# 云编译流水线：真机 config.gz + MT6771 4.14 源码树 → ksu_lkm_tp.ko
-# 注意：本版本从仓库根目录的 config.gz 解压出 .config（绕开网页上传隐藏文件限制）
-# 源码树：techyminati/android_kernel_realme_mt6771V（分支 lineage-18.1-rmui，完整树，4.14.142）
-#   —— Hadenix/kernel_umidigi_f2_mt6771_4.14 是残缺树（缺 Kconfig），不能用
-# 对齐 Android 官方 4.14 构建方式（build.config.mtk.aarch64）：
-#   CC=clang (NDK r21e, clang 9.0.8, 与设备 clang 9.0.3 同代)
-#   CROSS_COMPILE=GNU binutils (Ubuntu gcc-aarch64-linux-gnu 提供 as/objcopy)
-#   LD=ld.lld
-# 触发：push 或 Actions 页手动 Run workflow
-# 产物：Actions 页下载 artifact (ksu-lkm)
-
 on:
   workflow_dispatch:
   push:
@@ -35,7 +24,7 @@ jobs:
           unzip -q android-ndk-r21e-linux-x86_64.zip
           echo "NDK=$GITHUB_WORKSPACE/android-ndk-r21e" >> $GITHUB_ENV
 
-      - name: Prepare kernel (真机 config + modules_prepare)
+      - name: Prepare kernel (真机 config + modules_prepare + vermagic 对齐)
         run: |
           gzip -dc $GITHUB_WORKSPACE/config.gz > kernel/.config
           cd kernel
@@ -46,9 +35,7 @@ jobs:
           make ARCH=arm64 CC=clang LD=ld.lld NM=llvm-nm OBJCOPY=llvm-objcopy \
                CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- \
                modules_prepare
-          # 真机版本号 4.14.141+ vs 源码树 4.14.142 → 强制对齐 vermagic，否则 Exec format error
           sed -i 's/^#define UTS_RELEASE .*/#define UTS_RELEASE "4.14.141+"/' include/generated/utsrelease.h
-          echo "=== utsrelease.h after sed ==="
           grep UTS_RELEASE include/generated/utsrelease.h
 
       - name: Build LKM (ksu_lkm_sct.ko, 删 __versions 绕过 MODVERSIONS)
@@ -60,17 +47,22 @@ jobs:
                all
           # 删 __versions 段 → 内核完全跳过 MODVERSIONS CRC 检查；
           # vermagic 保留（sed 已对齐 4.14.141+），init_module 严格检查也能过。
-          aarch64-linux-gnu-objcopy --remove-section __versions ksu_lkm_sct.ko ksu_lkm_sct.nov.ko
+          # GNU objcopy 删段会因符号表残留 __versions 符号报错，优先 llvm-objcopy
+          llvm-objcopy --remove-section __versions --strip-symbol __versions \
+            ksu_lkm_sct.ko ksu_lkm_sct.nov.ko 2>/dev/null \
+            || aarch64-linux-gnu-objcopy --remove-section __versions --strip-symbol __versions \
+               ksu_lkm_sct.ko ksu_lkm_sct.nov.ko
           mv -f ksu_lkm_sct.nov.ko ksu_lkm_sct.ko
           echo "=== sections check (__versions should be gone) ==="
-          aarch64-linux-gnu-readelf -S ksu_lkm_sct.ko | grep -E '__versions' || echo "OK: no __versions section"
+          aarch64-linux-gnu-readelf -S ksu_lkm_sct.ko | grep -E '__versions' \
+            && echo "WARN: __versions still present!" \
+            || echo "OK: no __versions section"
 
       - name: Build kload (finit_module loader, arm64 static)
         run: |
           export PATH=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
           clang --target=aarch64-linux-android21 -static -O2 \
             $GITHUB_WORKSPACE/kload.c -o kload
-          file kload || true
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
