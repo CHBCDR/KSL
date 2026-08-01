@@ -1,6 +1,10 @@
+旧仓库：https://github.com/CHBCDR/ksu-lkm(已弃用)
+
+由DeepSeek V4 Flash编写
+
 # KSU LKM — MT6771 (4.14.141) 闭源内核 Root 授权模块
 
-**当前主力：`ksu_lkm_sct.c` — sys_call_table hook 版**（真机实测可用路线）。
+**当前主力：`ksu_lkm_sct.c` — sys_call_table hook 版**（真机可用路线）。
 
 ## 三个版本（按可行性排序）
 
@@ -10,7 +14,7 @@
 | `ksu_lkm_tp.c` | `sched_process_exec` tracepoint 探针 | ❌ **已死**：真机未导出 `__tracepoint_sched_process_exec`，加载报 `Unknown symbol`（2026-08-01 实测） |
 | `ksu_lkm_ft.c` | ftrace hook `do_execveat_common` | ❌ **不可行**：真机 `CONFIG_FUNCTION_TRACER` 未启用 |
 
-> ⚠️ **血泪教训（2026-08-01）**：tracepoint 在真机上事件可用（trace_pipe 能出），但 `__tracepoint_sched_process_exec` **没有 EXPORT_SYMBOL**——模块直接链接引用必然 `Unknown symbol (err 0)`，任何 flags 都救不了。**编译环境（realme 树导出）≠ 真机（MTK 魔改未导出）**，符号依赖必须以真机导出表为准。
+> ⚠️ **教训（2026-08-01）**：tracepoint 在真机上事件可用（trace_pipe 能出），但 `__tracepoint_sched_process_exec` **没有 EXPORT_SYMBOL**——模块直接链接引用必然 `Unknown symbol (err 0)`，任何 flags 都救不了。**编译环境（realme 树导出）≠ 真机（MTK 魔改未导出）**，符号依赖必须以真机导出表为准。
 
 ## sys_call_table hook 版原理
 
@@ -56,7 +60,7 @@ su -c 'cp /system/bin/sh /data/local/tmp/ksu && /data/local/tmp/ksu -c id'
 su -c 'rmmod ksu_lkm_sct'
 ```
 
-## 故障排查速查（2026-08-01 实测经验）
+## 故障排查速查（2026-08-01 实测）
 
 | 现象 | 病因 |
 |---|---|
