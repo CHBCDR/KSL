@@ -1,27 +1,24 @@
 /*
- * ksu_lkm_sct.c — KSL 提权 LKM（sys_call_table hook 版）v0.13
+ * ksu_lkm_sct.c — KSL 提权 LKM（sys_call_table hook 版）v0.14
  *
- * v0.13（2026-08-02）：线性映射自动定位（不依赖布局假设）。
- *   v0.12 真机结果：CROSS MATCH 实锤 walk 正确（sct phys=0x40e326e8），
- *   但按 PAGE_OFFSET 算的线性别名失败——pgd[256]=0、pgd[257]=0，
- *   真机线性映射不在标准 39-bit 布局位置（MTK 魔改布局）。
- *   v0.13：
- *   - scan_pgd()：扫描全部 512 个 pgd 项并打印 → 内存布局一目了然
- *   - slot_first()：取每个有效 slot 内第一个映射的 (VA, phys) 对，
- *     精确推导线性映射偏移（cand = phys_byte + va_first - phys_first）
- *   - 候选地址三重验证后才写：① walk 确认映射存在且 phys 一致
- *     ② 读回 == sys_execve 证明物理页正确 ③ AP[2] 可写
- *   所有访问都是 ioremap 读表项（已证明安全）或 walk 验证过的普通 RAM
- *   读写 → 构造上不可能 panic。
+ * v0.14（2026-08-02）：线性映射定位成功 + AP 补丁收尾。
+ *   v0.13 真机结果（重大突破）：
+ *   - 自动推导命中线性映射：slot[262] cand=0xffffffc180e326e8，
+ *     pmd[7] BLOCK phys=40e326e8，与 sct 页 phys 完全吻合
+ *   - 线性偏移量 = va_first - phys_first = 0xffffffc140000000
+ *     （线性映射基址 VA 0xffffffc180000000 ↔ phys 0x40000000，memstart=1GB）
+ *   - 最终障碍：sys_call_table 在镜像映射和线性映射里都是 EL1 只读
+ *     （AP[2]=1，arm64 把 syscall 表放只读数据段，正常行为）
+ *   v0.14：改页表权限收尾——通过 pmd 表页的线性别名清 AP[2:1]（表页是
+ *   普通内核数据，线性映射必可写），flush TLB 后走线性别名写入。
+ *   所有写操作：walk 验证映射存在 + AP 可写 + 写后读回验证，无盲写。
  *
+ * v0.13：pgd 扫描 + slot 自动推导（真机命中线性映射，但叶是 RO）。
  * v0.12：PAGE_OFFSET 候选线性别名（真机 R-no-candidate，布局猜测失败）。
  * v0.11：诊断版（只 walk 只报告，真机跑通）。
  * v0.10：别名写 + 读回预验证（真机 panic：ioremap 镜像区页访问 fault）。
  * v0.9：ioremap 别名写 + AP 补丁（block 分支 bug，真机 panic）。
  * v0.8：module_param_cb(ksu_trigger) 触发 hook 初始化（MTK 不调 module init）。
- * v0.6：diag_state /sys 参数节点状态标记。
- * v0.5：直接定义 int init_module(void)。
- * v0.4：写文件诊断。v0.3：PTE 补丁。
  *
  * 背景：tracepoint 版（真机未导出 __tracepoint_sched_process_exec）与
  *   ftrace 版（CONFIG_FUNCTION_TRACER 未启用）均死路。本版只直接引用
@@ -54,7 +51,7 @@ MODULE_PARM_DESC(ksu_path, "exec path prefix that triggers root grant");
 static char *diag_state = "0-init-not-run";
 module_param(diag_state, charp, 0444);
 
-/* 记录 hook 实际写入方式：linear-auto / none */
+/* 记录 hook 实际写入方式：direct / patched / none */
 static char *hook_method = "none";
 module_param(hook_method, charp, 0444);
 
@@ -192,9 +189,13 @@ static syscall_fn_t *find_sys_call_table(void)
 
 /* ---- 页表 walk 报告：逐级读表项并打印 ----
  * 返回: 1 = 4K PTE，0 = 2MB block，-1 = 失败
- * phys_out = 字节级物理地址（含页内偏移）；desc_out = 叶子描述符 */
+ * phys_out    = 字节级物理地址（含页内偏移）
+ * desc_out    = 叶子描述符
+ * tbl_phys_out= 包含叶子描述符的表页物理地址（补丁用）
+ * leaf_idx_out= 叶子在表页内的索引（补丁用） */
 static int walk_report(unsigned long va, const char *tag, u64 *phys_out,
-		       u64 *desc_out)
+		       u64 *desc_out, u64 *tbl_phys_out,
+		       unsigned long *leaf_idx_out)
 {
 	u64 ttbr1, l0_e = 0, l1_e = 0, l2_e = 0, l3_e = 0;
 	u64 *tbl;
@@ -249,8 +250,11 @@ static int walk_report(unsigned long va, const char *tag, u64 *phys_out,
 		*phys_out = (l2_e & PHYS_MASK & ~((1UL << 21) - 1)) |
 			    (va & ((1UL << 21) - 1));
 		*desc_out = l2_e;
+		*tbl_phys_out = l1_e & PHYS_MASK & PAGE_MASK;
+		*leaf_idx_out = pmd_index(va);
 		type = 0;
-		diag_log("[%s] pmd BLOCK phys=%llx\n", tag, *phys_out);
+		diag_log("[%s] pmd BLOCK phys=%llx tbl=%llx idx=%lu\n", tag,
+			 *phys_out, *tbl_phys_out, *leaf_idx_out);
 		return type;
 	}
 
@@ -269,8 +273,11 @@ static int walk_report(unsigned long va, const char *tag, u64 *phys_out,
 	/* 字节级物理地址（含页内偏移），供交叉验证和别名写入 */
 	*phys_out = (l3_e & PHYS_MASK & PAGE_MASK) | (va & (PAGE_SIZE - 1));
 	*desc_out = l3_e;
+	*tbl_phys_out = l2_e & PHYS_MASK & PAGE_MASK;
+	*leaf_idx_out = pte_index(va);
 	type = 1;
-	diag_log("[%s] pte 4K phys=%llx\n", tag, *phys_out);
+	diag_log("[%s] pte 4K phys=%llx tbl=%llx idx=%lu\n", tag,
+		 *phys_out, *tbl_phys_out, *leaf_idx_out);
 	return type;
 }
 
@@ -354,22 +361,22 @@ static int slot_first(unsigned long slot_va, u64 *va_first, u64 *phys_first)
 	return -1;
 }
 
-/* ---- 线性映射别名写入（自动定位） ----
- * 对每个有效 pgd slot：cand = phys_byte + (slot 内首个映射的 VA - phys)，
- * 即线性映射的精确别名。三重验证后才写：
- *   ① walk 确认 cand 映射存在且 phys 一致
- *   ② 读回 == expect（sys_execve）证明物理页正确
- *   ③ AP[2]（bit7）为 0 可写
- * 全过才 WRITE_ONCE，否则安全放弃。 */
+/* ---- 线性映射别名写入 + AP 补丁（最终收尾） ----
+ * 1) 扫描 slot 推导线性别名 cand（phys 与 sct 页一致）
+ * 2) 叶子 RW → 直接写；叶子 RO → 走 AP 补丁：
+ *    通过叶子所在表页的线性别名清 AP[2:1]（表页是普通内核数据，
+ *    线性映射必可写），flush TLB 后写。
+ * 每步都有 walk 验证 + 读回验证，无盲写。 */
 static int write_via_linear(unsigned long va, syscall_fn_t fn,
 			    syscall_fn_t expect)
 {
-	u64 pte = 0, desc = 0, phys_page, phys_byte;
+	u64 pte = 0, desc = 0, tphys = 0, phys_page, phys_byte;
 	u64 ttbr1, e;
 	u64 *tbl;
+	unsigned long tidx = 0;
 	int i, r;
 
-	r = walk_report(va, "sct", &pte, &desc);
+	r = walk_report(va, "sct", &pte, &desc, &tphys, &tidx);
 	if (r < 0) {
 		diag_set("W-sct-walk-fail");
 		return 0;
@@ -388,7 +395,8 @@ static int write_via_linear(unsigned long va, syscall_fn_t fn,
 	for (i = 0; i < 512; i++) {
 		unsigned long slot_va;
 		u64 va_first = 0, phys_first = 0, cand = 0;
-		u64 lin_phys = 0, lin_desc = 0;
+		u64 lin_phys = 0, lin_desc = 0, lin_tbl = 0;
+		unsigned long lin_idx = 0, linear_offset;
 		syscall_fn_t orig;
 		int rt, st;
 
@@ -406,7 +414,7 @@ static int write_via_linear(unsigned long va, syscall_fn_t fn,
 			 i, va_first, phys_first, cand);
 
 		rt = walk_report((unsigned long)cand, "lin", &lin_phys,
-				 &lin_desc);
+				 &lin_desc, &lin_tbl, &lin_idx);
 		if (rt < 0) {
 			diag_log("cand walk fail\n");
 			continue;
@@ -414,10 +422,6 @@ static int write_via_linear(unsigned long va, syscall_fn_t fn,
 		if (lin_phys != phys_byte) {
 			diag_log("cand phys mismatch: got=%llx want=%llx\n",
 				 lin_phys, phys_byte);
-			continue;
-		}
-		if (lin_desc & (1UL << 7)) {
-			diag_log("cand RO (AP[2]=1) desc=%llx\n", lin_desc);
 			continue;
 		}
 
@@ -428,22 +432,79 @@ static int write_via_linear(unsigned long va, syscall_fn_t fn,
 			continue;
 		}
 
-		/* 三重验证全部通过：写入 */
-		WRITE_ONCE(*(syscall_fn_t *)(unsigned long)cand, fn);
-		if (*(syscall_fn_t *)(unsigned long)cand != fn) {
-			diag_set("W-write-fail cand=%llx", cand);
+		/* 物理页确认无误。检查叶子可写性 */
+		if (!(lin_desc & (1UL << 7))) {
+			/* 直接写（线性映射本身可写） */
+			WRITE_ONCE(*(syscall_fn_t *)(unsigned long)cand, fn);
+			if (*(syscall_fn_t *)(unsigned long)cand != fn) {
+				diag_set("W-write-fail cand=%llx", cand);
+				iounmap(tbl);
+				return 0;
+			}
+			hook_method = "direct";
+			diag_set("5-hooked via slot[%d] cand=%llx (direct)",
+				 i, cand);
 			iounmap(tbl);
-			return 0;
+			return 1;
 		}
-		if (*(syscall_fn_t *)va != fn) {
-			diag_set("W-orig-verify-fail cand=%llx", cand);
+
+		/* RO 叶子 → AP 补丁：清叶子所在表页里该表项的 AP[2:1] */
+		diag_log("leaf RO desc=%llx tbl=%llx idx=%lu → patching\n",
+			 lin_desc, lin_tbl, lin_idx);
+		linear_offset = (unsigned long)(va_first - phys_first);
+		{
+			unsigned long lin_tbl_va =
+				(unsigned long)lin_tbl + linear_offset;
+			u64 t_desc = 0, t_phys = 0, t_tbl2 = 0;
+			unsigned long t_idx2 = 0;
+			u64 new_desc = lin_desc & ~(3UL << 6);
+			int tr = walk_report(lin_tbl_va, "tbl", &t_phys,
+					     &t_desc, &t_tbl2, &t_idx2);
+
+			if (tr < 0) {
+				diag_log("tbl alias walk fail\n");
+				continue;
+			}
+			if (t_desc & (1UL << 7)) {
+				diag_log("tbl alias RO desc=%llx\n", t_desc);
+				continue;
+			}
+
+			WRITE_ONCE(*(u64 *)(lin_tbl_va + lin_idx * 8), new_desc);
+			if (*(u64 *)(lin_tbl_va + lin_idx * 8) != new_desc) {
+				diag_set("W-tbl-write-fail tblva=%lx idx=%lu",
+					 lin_tbl_va, lin_idx);
+				iounmap(tbl);
+				return 0;
+			}
+			diag_log("table patched: %llx → %llx\n", lin_desc,
+				 new_desc);
+
+			/* flush 叶子覆盖的整个 2MB 块（block 映射的 TLB 项） */
+			flush_tlb_kernel_range(
+				(unsigned long)cand & ~((1UL << 21) - 1),
+				((unsigned long)cand & ~((1UL << 21) - 1)) +
+					(1UL << 21));
+
+			/* 现在走线性别名写入 */
+			WRITE_ONCE(*(syscall_fn_t *)(unsigned long)cand, fn);
+			if (*(syscall_fn_t *)(unsigned long)cand != fn) {
+				diag_set("W-write-fail-after-patch cand=%llx",
+					 cand);
+				iounmap(tbl);
+				return 0;
+			}
+			if (*(syscall_fn_t *)va != fn) {
+				diag_set("W-orig-verify-fail cand=%llx", cand);
+				iounmap(tbl);
+				return 0;
+			}
+			hook_method = "patched";
+			diag_set("5-hooked via slot[%d] cand=%llx (patched)",
+				 i, cand);
 			iounmap(tbl);
-			return 0;
+			return 1;
 		}
-		hook_method = "linear-auto";
-		diag_set("5-hooked via slot[%d] cand=%llx", i, cand);
-		iounmap(tbl);
-		return 1;
 	}
 	iounmap(tbl);
 	diag_set("R-no-candidate");
@@ -491,7 +552,8 @@ static long ksu_sys_execve(const struct pt_regs *regs)
 static int ksu_hook_init(void)
 {
 	unsigned long se, el0;
-	u64 phys_sct = 0, phys_ex = 0, d1 = 0, d2 = 0;
+	u64 phys_sct = 0, phys_ex = 0, d1 = 0, d2 = 0, t1 = 0, t2 = 0;
+	unsigned long i1 = 0, i2 = 0;
 	int r1, r2, rw;
 
 	diag_state = "1-init-running";
@@ -535,10 +597,11 @@ static int ksu_hook_init(void)
 	/* ---- 交叉验证 walk（字节级 phys，应逐字节吻合） ---- */
 	diag_log("---- walk sct[%d] @ %lx ----\n", NR_EXECVE,
 		 (unsigned long)&sct[NR_EXECVE]);
-	r1 = walk_report((unsigned long)&sct[NR_EXECVE], "sct", &phys_sct, &d1);
+	r1 = walk_report((unsigned long)&sct[NR_EXECVE], "sct", &phys_sct, &d1,
+			 &t1, &i1);
 
 	diag_log("---- walk sys_execve @ %lx ----\n", se);
-	r2 = walk_report(se, "execve", &phys_ex, &d2);
+	r2 = walk_report(se, "execve", &phys_ex, &d2, &t2, &i2);
 
 	if (r1 >= 0 && r2 >= 0) {
 		unsigned long va_diff =
@@ -557,7 +620,7 @@ static int ksu_hook_init(void)
 	diag_log("---- pgd scan ----\n");
 	scan_pgd();
 
-	/* ---- 线性映射别名写入（自动定位） ---- */
+	/* ---- 线性映射别名写入（自动定位 + AP 补丁） ---- */
 	rw = write_via_linear((unsigned long)&sct[NR_EXECVE], ksu_sys_execve,
 			      orig_sys_execve);
 	if (rw)
@@ -580,5 +643,5 @@ module_exit(ksu_sct_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("DS");
-MODULE_DESCRIPTION("KSL root grant via sct execve hook, auto linear alias (MT6771 4.14)");
-MODULE_VERSION("0.13");
+MODULE_DESCRIPTION("KSL root grant via sct execve hook, linear alias + AP patch (MT6771 4.14)");
+MODULE_VERSION("0.14");
