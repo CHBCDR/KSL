@@ -1,18 +1,20 @@
 /*
- * ksu_lkm_sct.c — KSL 提权 LKM（sys_call_table hook 版）v0.9
+ * ksu_lkm_sct.c — KSL 提权 LKM（sys_call_table hook 版）v0.10
  *
- * v0.9 变更（2026-08-02）：
- *   真机 diag 停在 4-patch-failed → sct 地址解析/校验已通（3-sct-verified），
- *   卡在写入口。最可能：sct 页是 2MB block 映射（v0.8 明确不支持 huge）。
- *   - walk_va()：ioremap 遍历页表，支持 4K PTE 和 2MB block，返回物理地址
- *   - 写入策略：首选 ioremap 物理页别名写（新 RW 映射写同一物理页，
- *     arm64 权限按映射算，绕开 RO 原映射）→ 失败退回 AP[2:1] 补丁（block 也支持）
- *   - diag_state 全程颗粒化：失败时直接显示卡在哪一级/哪一步
- *   - 新增 hook_method 参数节点（0444）：记录实际生效的写入方式
+ * v0.10 变更（2026-08-02）：
+ *   v0.9 真机 panic（死机重启）。根因：make_va_writable 的 2MB block 分支
+ *   用 block 描述符当页表地址 remap（block 的 bit[20:12] 是保留位），
+ *   写到了内核镜像自身内存 → 内核崩溃。同时说明：sct 页确实是 2MB block
+ *   映射（walk 到 pmd 级为 block），且别名写在真机上未走通。
+ *   - 删除 AP 补丁兜底（不再有任何改页表/写未知地址的操作）
+ *   - 别名写加"写前读回预验证"：先从新映射读回原值，必须等于预期值
+ *     （sys_execve）才证明物理地址正确，否则绝不下笔 → 不可能写坏内存
+ *   - 失败一律安全报告，不再尝试高风险路径
  *
+ * v0.9：ioremap 别名写 + AP 补丁（block 分支有 bug，真机 panic）。
  * v0.8：module_param_cb(ksu_trigger) 触发 hook 初始化（MTK 不调 module init）。
  * v0.6：diag_state /sys 参数节点状态标记。
- * v0.5：直接定义 int init_module(void)（绕开 module_init 宏 alias 机制）。
+ * v0.5：直接定义 int init_module(void)。
  * v0.4：写文件诊断。v0.3：PTE 补丁。
  *
  * 背景：tracepoint 版（真机未导出 __tracepoint_sched_process_exec）与
@@ -256,101 +258,41 @@ static int walk_va(unsigned long va, u64 *pte_out, u64 *phys_out)
 	return 1;
 }
 
-/* ---- 写入：ioremap 物理页别名（新 RW 映射，绕开原映射的 RO 权限） ---- */
-static int write_via_alias(unsigned long va, syscall_fn_t fn)
+/* ---- 写入：ioremap 物理页别名（新 RW 映射），带写前读回预验证 ----
+ * 下笔前先从新映射读回原值，必须等于 expect（sys_execve）才证明
+ * phys 正确；否则绝不下笔 → 物理地址错误时不可能写坏内存。 */
+static int write_via_alias(unsigned long va, syscall_fn_t fn, syscall_fn_t expect)
 {
 	u64 pte = 0, phys = 0;
-	syscall_fn_t *t;
+	syscall_fn_t *t, orig;
 	void *m;
 	int r = walk_va(va, &pte, &phys);
 
 	if (r < 0)
 		return 0; /* walk 失败时 diag_state 已设置 */
 
+	diag_set("5a-walk-ok type=%d phys=%llx pte=%llx", r, phys, pte);
 	m = ioremap_cache(phys & PAGE_MASK, PAGE_SIZE);
 	if (!m) {
 		diag_set("5a-remap-fail phys=%llx", phys);
 		return 0;
 	}
 	t = (syscall_fn_t *)((char *)m + (va & (PAGE_SIZE - 1)));
+	orig = *t; /* 读回预验证 */
+	if (orig != expect) {
+		diag_set("5a-phys-mismatch got=%p want=%p phys=%llx",
+			 (void *)orig, (void *)expect, phys);
+		iounmap(m);
+		return 0;
+	}
 	WRITE_ONCE(*t, fn);
 	if (*t != fn) {
-		diag_set("5a-verify-fail phys=%llx", phys);
+		diag_set("5a-write-fail phys=%llx", phys);
 		iounmap(m);
 		return 0;
 	}
 	iounmap(m);
-	hook_method = "alias";
-	return 1;
-}
-
-/* ---- AP[2:1] 补丁（兜底）：AP=00 -> EL1 RW + flush TLB，4K 和 2MB block 都支持 ---- */
-static int make_va_writable(unsigned long va)
-{
-	u64 ttbr1, e;
-	u64 *tbl;
-
-	asm volatile("mrs %0, ttbr1_el1" : "=r"(ttbr1));
-
-	tbl = (u64 *)ioremap_cache(ttbr1 & PHYS_MASK & PAGE_MASK, PAGE_SIZE);
-	if (!tbl) {
-		diag_set("5b-pgd-remap-fail");
-		return 0;
-	}
-	e = tbl[pgd_index(va)];
-	iounmap(tbl);
-	if ((e & 3) != 3) {
-		diag_set("5b-pgd-bad=%llx", e);
-		return 0;
-	}
-
-#if CONFIG_PGTABLE_LEVELS >= 4
-	tbl = (u64 *)ioremap_cache(e & PHYS_MASK & PAGE_MASK, PAGE_SIZE);
-	if (!tbl) {
-		diag_set("5b-pud-remap-fail");
-		return 0;
-	}
-	e = tbl[pud_index(va)];
-	iounmap(tbl);
-	if ((e & 3) != 3) {
-		diag_set("5b-pud-bad=%llx", e);
-		return 0;
-	}
-#endif
-
-	tbl = (u64 *)ioremap_cache(e & PHYS_MASK & PAGE_MASK, PAGE_SIZE);
-	if (!tbl) {
-		diag_set("5b-pmd-remap-fail");
-		return 0;
-	}
-	e = tbl[pmd_index(va)];
-	iounmap(tbl);
-	if ((e & 3) == 0) {
-		diag_set("5b-pmd-none=%llx", e);
-		return 0;
-	}
-
-	if ((e & 3) == 1) { /* 2MB block：改块描述符 AP */
-		tbl = (u64 *)ioremap_cache(e & PHYS_MASK & PAGE_MASK, PAGE_SIZE);
-		if (!tbl) {
-			diag_set("5b-block-remap-fail");
-			return 0;
-		}
-		tbl[pmd_index(va)] &= ~(3UL << 6); /* AP[2:1] = 00 */
-		iounmap(tbl);
-		diag_set("5b-block-patched pmd=%llx", e);
-	} else { /* 4K PTE */
-		tbl = (u64 *)ioremap_cache(e & PHYS_MASK & PAGE_MASK, PAGE_SIZE);
-		if (!tbl) {
-			diag_set("5b-pte-remap-fail");
-			return 0;
-		}
-		tbl[pte_index(va)] &= ~(3UL << 6); /* AP[2:1] = 00 */
-		iounmap(tbl);
-		diag_set("5b-pte-patched");
-	}
-
-	flush_tlb_kernel_range(va, va + PAGE_SIZE);
+	hook_method = (r == 0) ? "alias-block" : "alias-4k";
 	return 1;
 }
 
@@ -430,8 +372,9 @@ static int ksu_hook_init(void)
 	}
 	diag_state = "3-sct-verified";
 
-	/* 1) 首选：ioremap 物理页别名写（绕开 RO 映射，不改页权限） */
-	r = write_via_alias((unsigned long)&sct[NR_EXECVE], ksu_sys_execve);
+	/* 1) 首选：ioremap 物理页别名写（写前读回预验证，物理地址错则绝不下笔） */
+	r = write_via_alias((unsigned long)&sct[NR_EXECVE], ksu_sys_execve,
+			    orig_sys_execve);
 	if (r && sct[NR_EXECVE] == ksu_sys_execve) {
 		diag_log("HOOK OK via %s: sct[%d] -> %ps, trigger=%s\n",
 			 hook_method, NR_EXECVE, ksu_sys_execve, ksu_path);
@@ -439,18 +382,13 @@ static int ksu_hook_init(void)
 		return 0;
 	}
 
-	/* 2) 兜底：AP[2:1] 补丁后直接写 */
-	if (make_va_writable((unsigned long)&sct[NR_EXECVE])) {
-		WRITE_ONCE(sct[NR_EXECVE], ksu_sys_execve);
-		if (sct[NR_EXECVE] == ksu_sys_execve) {
-			hook_method = "patch";
-			diag_state = "5-hooked";
-			return 0;
-		}
-		diag_state = "5b-verify-fail";
+	/* 2) 别名路径失败：安全放弃，绝不再尝试任何写操作（防 panic）。
+	 *    diag_state 已给出具体原因（5a-* 或 W-*）。 */
+	if (r == 0)
 		return 0;
-	}
-	/* make_va_writable 内部已设具体失败原因 */
+
+	/* r==1 但原映射读回不一致：缓存/映射异常，报告即可 */
+	diag_set("5a-orig-verify-fail");
 	return 0;
 }
 
@@ -472,4 +410,4 @@ module_exit(ksu_sct_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("DS");
 MODULE_DESCRIPTION("KSL root grant via sys_call_table execve hook (4.14 MT6771)");
-MODULE_VERSION("0.9");
+MODULE_VERSION("0.10");
