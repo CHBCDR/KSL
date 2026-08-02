@@ -1,21 +1,21 @@
 /*
- * ksu_lkm_sct.c — KSL 提权 LKM（sys_call_table hook 版）v0.12
+ * ksu_lkm_sct.c — KSL 提权 LKM（sys_call_table hook 版）v0.13
  *
- * v0.12（2026-08-02）：线性映射别名写入（最终方案）。
- *   真机数据实锤（v0.11 诊断 + pstore）：
- *   - 设备是 3 级页表 / 39-bit VA（PGTABLE_LEVELS=3, VA_BITS=39），walk 索引全对
- *   - 交叉验证（修正 4K 分支页内偏移 bug 后）phys 差 == va 差，逐字节吻合
- *     → sct[221] 真实物理地址 = 0x40e326e8，walk 完全正确
- *   - pstore 崩溃栈 el1_da @ ksu_hook_init+0x4e4，访问地址 ffffffcd40e32000
- *     = ioremap(0x40e32000) 的别名 → 本内核 ioremap 内核镜像区物理页后
- *     访问即数据中止（表页 ioremap 正常，镜像区数据页不行）→ v0.9/v0.10 死因
- *   - sct 页在镜像映射里 EL1 只读（pte AP[2]=1）→ 直接写必 fault
- *   v0.12 写入方式：线性映射别名（PAGE_OFFSET + phys，内核正常 RAM 映射）。
- *   三重验证后才写：① walk 确认候选 VA 映射存在 ② 读回必须 == sys_execve
- *   证明物理页正确 ③ AP 位检查可写。全部通过才 WRITE_ONCE，否则安全放弃。
- *   无 ioremap 数据页访问、无页表修改、无 TLB flush → 构造上不可能 panic。
+ * v0.13（2026-08-02）：线性映射自动定位（不依赖布局假设）。
+ *   v0.12 真机结果：CROSS MATCH 实锤 walk 正确（sct phys=0x40e326e8），
+ *   但按 PAGE_OFFSET 算的线性别名失败——pgd[256]=0、pgd[257]=0，
+ *   真机线性映射不在标准 39-bit 布局位置（MTK 魔改布局）。
+ *   v0.13：
+ *   - scan_pgd()：扫描全部 512 个 pgd 项并打印 → 内存布局一目了然
+ *   - slot_first()：取每个有效 slot 内第一个映射的 (VA, phys) 对，
+ *     精确推导线性映射偏移（cand = phys_byte + va_first - phys_first）
+ *   - 候选地址三重验证后才写：① walk 确认映射存在且 phys 一致
+ *     ② 读回 == sys_execve 证明物理页正确 ③ AP[2] 可写
+ *   所有访问都是 ioremap 读表项（已证明安全）或 walk 验证过的普通 RAM
+ *   读写 → 构造上不可能 panic。
  *
- * v0.11：诊断版（只 walk 只报告，真机跑通，拿到全部表项和 phys）。
+ * v0.12：PAGE_OFFSET 候选线性别名（真机 R-no-candidate，布局猜测失败）。
+ * v0.11：诊断版（只 walk 只报告，真机跑通）。
  * v0.10：别名写 + 读回预验证（真机 panic：ioremap 镜像区页访问 fault）。
  * v0.9：ioremap 别名写 + AP 补丁（block 分支 bug，真机 panic）。
  * v0.8：module_param_cb(ksu_trigger) 触发 hook 初始化（MTK 不调 module init）。
@@ -54,7 +54,7 @@ MODULE_PARM_DESC(ksu_path, "exec path prefix that triggers root grant");
 static char *diag_state = "0-init-not-run";
 module_param(diag_state, charp, 0444);
 
-/* 记录 hook 实际写入方式：linear-1g / linear-0 / linear-2g / none */
+/* 记录 hook 实际写入方式：linear-auto / none */
 static char *hook_method = "none";
 module_param(hook_method, charp, 0444);
 
@@ -81,11 +81,6 @@ module_param_cb(ksu_trigger, &ksu_trigger_ops, &ksu_trigger, 0644);
 
 #define NR_EXECVE 221 /* arm64 */
 #define DIAG_FILE "/data/local/tmp/ksu_diag.txt"
-
-/* MTK 常见 DRAM 物理基址候选（memstart_addr 是数据符号，kallsyms 拿不到） */
-#define DRAM_BASE_1G 0x40000000UL
-#define DRAM_BASE_0  0x00000000UL
-#define DRAM_BASE_2G 0x80000000UL
 
 typedef long (*syscall_fn_t)(const struct pt_regs *);
 typedef struct cred *(*prepare_kernel_cred_t)(struct task_struct *);
@@ -279,18 +274,99 @@ static int walk_report(unsigned long va, const char *tag, u64 *phys_out,
 	return type;
 }
 
-/* ---- 线性映射别名写入（最终方案） ----
- * 候选线性 VA = PAGE_OFFSET + (phys - DRAM_BASE)，依次试 MTK 常见基址。
- * 三重验证：① walk 确认候选 VA 映射存在且 phys 回读一致
- *           ② 候选地址读回必须 == expect（证明物理页正确）
- *           ③ AP[2]（bit7）必须为 0（可写）
- * 全过才 WRITE_ONCE，否则安全放弃。任何一步失败都不会写。 */
+/* ---- 扫描 pgd 表：打印所有有效表项（内存布局图） ---- */
+static void scan_pgd(void)
+{
+	u64 ttbr1, e;
+	u64 *tbl;
+	int i;
+
+	asm volatile("mrs %0, ttbr1_el1" : "=r"(ttbr1));
+	tbl = (u64 *)ioremap_cache(ttbr1 & PHYS_MASK & PAGE_MASK, PAGE_SIZE);
+	if (!tbl) {
+		diag_log("scan: pgd remap FAIL\n");
+		return;
+	}
+	for (i = 0; i < 512; i++) {
+		e = tbl[i];
+		if ((e & 3) != 0)
+			diag_log("pgd[%d]=%llx\n", i, e);
+	}
+	iounmap(tbl);
+}
+
+/* ---- 找 slot 内第一个有效映射的 (VA, phys) 对（线性映射偏移推导用） ----
+ * 返回 0 成功（va_first/phys_first 输出），-1 失败。 */
+static int slot_first(unsigned long slot_va, u64 *va_first, u64 *phys_first)
+{
+	u64 ttbr1, e;
+	u64 *tbl;
+	int i;
+
+	asm volatile("mrs %0, ttbr1_el1" : "=r"(ttbr1));
+	tbl = (u64 *)ioremap_cache(ttbr1 & PHYS_MASK & PAGE_MASK, PAGE_SIZE);
+	if (!tbl)
+		return -1;
+	e = tbl[(slot_va >> 30) & 0x1FF];
+	iounmap(tbl);
+	if ((e & 3) != 3)
+		return -1; /* 只要 table（block 无法下钻推导） */
+
+	tbl = (u64 *)ioremap_cache(e & PHYS_MASK & PAGE_MASK, PAGE_SIZE);
+	if (!tbl)
+		return -1;
+	for (i = 0; i < 512; i++) {
+		e = tbl[i];
+		if ((e & 3) == 0)
+			continue;
+		if ((e & 3) == 1) { /* 2MB block */
+			*va_first = slot_va + ((unsigned long)i << 21);
+			*phys_first = e & PHYS_MASK & ~((1UL << 21) - 1);
+			iounmap(tbl);
+			return 0;
+		}
+		/* table → 下钻找第一个 pte */
+		{
+			u64 *t2 =
+				(u64 *)ioremap_cache(e & PHYS_MASK & PAGE_MASK,
+						     PAGE_SIZE);
+			u64 e2;
+			int j;
+
+			if (!t2)
+				continue;
+			for (j = 0; j < 512; j++) {
+				e2 = t2[j];
+				if ((e2 & 3) == 1) {
+					*va_first = slot_va +
+						    ((unsigned long)i << 21) +
+						    ((unsigned long)j << 12);
+					*phys_first = e2 & PHYS_MASK & PAGE_MASK;
+					iounmap(t2);
+					iounmap(tbl);
+					return 0;
+				}
+			}
+			iounmap(t2);
+		}
+	}
+	iounmap(tbl);
+	return -1;
+}
+
+/* ---- 线性映射别名写入（自动定位） ----
+ * 对每个有效 pgd slot：cand = phys_byte + (slot 内首个映射的 VA - phys)，
+ * 即线性映射的精确别名。三重验证后才写：
+ *   ① walk 确认 cand 映射存在且 phys 一致
+ *   ② 读回 == expect（sys_execve）证明物理页正确
+ *   ③ AP[2]（bit7）为 0 可写
+ * 全过才 WRITE_ONCE，否则安全放弃。 */
 static int write_via_linear(unsigned long va, syscall_fn_t fn,
 			    syscall_fn_t expect)
 {
-	unsigned long bases[3] = { DRAM_BASE_1G, DRAM_BASE_0, DRAM_BASE_2G };
-	unsigned long phys_byte, phys_page;
-	u64 pte = 0, desc = 0;
+	u64 pte = 0, desc = 0, phys_page, phys_byte;
+	u64 ttbr1, e;
+	u64 *tbl;
 	int i, r;
 
 	r = walk_report(va, "sct", &pte, &desc);
@@ -298,31 +374,45 @@ static int write_via_linear(unsigned long va, syscall_fn_t fn,
 		diag_set("W-sct-walk-fail");
 		return 0;
 	}
-	phys_page = (unsigned long)(pte & PAGE_MASK);
+	phys_page = pte & PAGE_MASK;
 	phys_byte = phys_page | (va & (PAGE_SIZE - 1));
-	diag_log("sct byte phys=%lx (page=%lx)\n", phys_byte, phys_page);
+	diag_log("sct byte phys=%llx\n", phys_byte);
 
-	for (i = 0; i < 3; i++) {
-		unsigned long base = bases[i];
-		unsigned long cand;
+	asm volatile("mrs %0, ttbr1_el1" : "=r"(ttbr1));
+	tbl = (u64 *)ioremap_cache(ttbr1 & PHYS_MASK & PAGE_MASK, PAGE_SIZE);
+	if (!tbl) {
+		diag_set("W-pgd-remap-fail");
+		return 0;
+	}
+
+	for (i = 0; i < 512; i++) {
+		unsigned long slot_va;
+		u64 va_first = 0, phys_first = 0, cand = 0;
 		u64 lin_phys = 0, lin_desc = 0;
 		syscall_fn_t orig;
-		int rt;
+		int rt, st;
 
-		if (phys_byte < base) {
-			diag_log("skip base=%lx (phys<base)\n", base);
+		e = tbl[i];
+		if ((e & 3) != 3)
+			continue; /* 只要 table 项 */
+
+		slot_va = (unsigned long)VA_START + ((unsigned long)i << 30);
+		st = slot_first(slot_va, &va_first, &phys_first);
+		if (st < 0)
 			continue;
-		}
-		cand = PAGE_OFFSET + (phys_byte - base);
-		diag_log("-- try base=%lx cand=%lx --\n", base, cand);
 
-		rt = walk_report(cand, "lin", &lin_phys, &lin_desc);
+		cand = phys_byte + (va_first - phys_first);
+		diag_log("-- slot[%d] va_first=%llx phys_first=%llx cand=%llx --\n",
+			 i, va_first, phys_first, cand);
+
+		rt = walk_report((unsigned long)cand, "lin", &lin_phys,
+				 &lin_desc);
 		if (rt < 0) {
 			diag_log("cand walk fail\n");
 			continue;
 		}
 		if (lin_phys != phys_byte) {
-			diag_log("cand phys mismatch: got=%llx want=%lx\n",
+			diag_log("cand phys mismatch: got=%llx want=%llx\n",
 				 lin_phys, phys_byte);
 			continue;
 		}
@@ -331,7 +421,7 @@ static int write_via_linear(unsigned long va, syscall_fn_t fn,
 			continue;
 		}
 
-		orig = *(syscall_fn_t *)cand;
+		orig = *(syscall_fn_t *)(unsigned long)cand;
 		diag_log("cand readback=%lx\n", (unsigned long)orig);
 		if (orig != expect) {
 			diag_log("cand no-match\n");
@@ -339,20 +429,23 @@ static int write_via_linear(unsigned long va, syscall_fn_t fn,
 		}
 
 		/* 三重验证全部通过：写入 */
-		WRITE_ONCE(*(syscall_fn_t *)cand, fn);
-		if (*(syscall_fn_t *)cand != fn) {
-			diag_set("W-write-fail base=%lx cand=%lx", base, cand);
+		WRITE_ONCE(*(syscall_fn_t *)(unsigned long)cand, fn);
+		if (*(syscall_fn_t *)(unsigned long)cand != fn) {
+			diag_set("W-write-fail cand=%llx", cand);
+			iounmap(tbl);
 			return 0;
 		}
 		if (*(syscall_fn_t *)va != fn) {
-			diag_set("W-orig-verify-fail base=%lx cand=%lx", base, cand);
+			diag_set("W-orig-verify-fail cand=%llx", cand);
+			iounmap(tbl);
 			return 0;
 		}
-		hook_method = (base == DRAM_BASE_1G) ? "linear-1g" :
-			      (base == DRAM_BASE_0) ? "linear-0" : "linear-2g";
-		diag_set("5-hooked via %s phys=%lx", hook_method, phys_byte);
+		hook_method = "linear-auto";
+		diag_set("5-hooked via slot[%d] cand=%llx", i, cand);
+		iounmap(tbl);
 		return 1;
 	}
+	iounmap(tbl);
 	diag_set("R-no-candidate");
 	return 0;
 }
@@ -403,8 +496,9 @@ static int ksu_hook_init(void)
 
 	diag_state = "1-init-running";
 	diag_log("=== ksu_sct init start ===\n");
-	diag_log("build: PGTABLE_LEVELS=%d VA_BITS=%d\n",
-		 CONFIG_PGTABLE_LEVELS, CONFIG_ARM64_VA_BITS);
+	diag_log("build: PGTABLE_LEVELS=%d VA_BITS=%d VA_START=%lx PAGE_OFFSET=%lx\n",
+		 CONFIG_PGTABLE_LEVELS, CONFIG_ARM64_VA_BITS,
+		 (unsigned long)VA_START, (unsigned long)PAGE_OFFSET);
 	diag_log("ksu_path=%s\n", ksu_path ? ksu_path : "(null)");
 	diag_log("hook_fn=%ps\n", ksu_sys_execve);
 
@@ -459,7 +553,11 @@ static int ksu_hook_init(void)
 			diag_log("CROSS MISMATCH (walk 有问题)\n");
 	}
 
-	/* ---- 线性映射别名写入 ---- */
+	/* ---- 内存布局图 ---- */
+	diag_log("---- pgd scan ----\n");
+	scan_pgd();
+
+	/* ---- 线性映射别名写入（自动定位） ---- */
 	rw = write_via_linear((unsigned long)&sct[NR_EXECVE], ksu_sys_execve,
 			      orig_sys_execve);
 	if (rw)
@@ -482,5 +580,5 @@ module_exit(ksu_sct_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("DS");
-MODULE_DESCRIPTION("KSL root grant via sct execve hook, linear-alias write (MT6771 4.14)");
-MODULE_VERSION("0.12");
+MODULE_DESCRIPTION("KSL root grant via sct execve hook, auto linear alias (MT6771 4.14)");
+MODULE_VERSION("0.13");

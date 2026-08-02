@@ -135,7 +135,8 @@ extern long strncpy_from_user(char *dst, const char __user *src, long count);
 /* 页表 mock：手动遍历版（ksu_lkm_sct.c: va_writable，TTBR1+ioremap）*/
 #define CONFIG_PGTABLE_LEVELS 3
 #define CONFIG_ARM64_VA_BITS 48
-#define PAGE_OFFSET (0xffffff8000000000UL)
+#define VA_START (0xffffff8000000000UL)
+#define PAGE_OFFSET (0xffffffc000000000UL)
 #define PAGE_SHIFT 12
 #define PAGE_SIZE (1UL << PAGE_SHIFT)
 #define PAGE_MASK (~(PAGE_SIZE - 1))
