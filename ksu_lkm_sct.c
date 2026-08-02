@@ -1,16 +1,19 @@
 /*
- * ksu_lkm_sct.c — KernelSU 提权 LKM（sys_call_table hook 版）v0.6
+ * ksu_lkm_sct.c — KSL 提权 LKM（sys_call_table hook 版）v0.9
  *
- * v0.6 变更：/sys 参数节点状态标记（diag_state）。
- *   实测：exit 能写 ksu_diag.txt 而 init 写不进（或 init 未执行），文件诊断
- *   不可靠。改为 module_param(diag_state, charp, 0444)——init 每走一步就更新
- *   diag_state 指针，用户 cat /sys/module/ksu_lkm_sct/parameters/diag_state
- *   即可看到 init 执行进度（0=init 没跑 / 1=在跑 / 5=hooked / 8=提权）。
- *   零依赖文件权限、dmesg、logcat。
+ * v0.9 变更（2026-08-02）：
+ *   真机 diag 停在 4-patch-failed → sct 地址解析/校验已通（3-sct-verified），
+ *   卡在写入口。最可能：sct 页是 2MB block 映射（v0.8 明确不支持 huge）。
+ *   - walk_va()：ioremap 遍历页表，支持 4K PTE 和 2MB block，返回物理地址
+ *   - 写入策略：首选 ioremap 物理页别名写（新 RW 映射写同一物理页，
+ *     arm64 权限按映射算，绕开 RO 原映射）→ 失败退回 AP[2:1] 补丁（block 也支持）
+ *   - diag_state 全程颗粒化：失败时直接显示卡在哪一级/哪一步
+ *   - 新增 hook_method 参数节点（0444）：记录实际生效的写入方式
  *
- * v0.5：直接定义 int init_module(void)（绕开 module_init 宏的 alias 机制）。
- * v0.4：写文件诊断（/data/local/tmp/ksu_diag.txt）。
- * v0.3：PTE 补丁（页只读时改 AP 位 + flush TLB + 写回验证）。
+ * v0.8：module_param_cb(ksu_trigger) 触发 hook 初始化（MTK 不调 module init）。
+ * v0.6：diag_state /sys 参数节点状态标记。
+ * v0.5：直接定义 int init_module(void)（绕开 module_init 宏 alias 机制）。
+ * v0.4：写文件诊断。v0.3：PTE 补丁。
  *
  * 背景：tracepoint 版（真机未导出 __tracepoint_sched_process_exec）与
  *   ftrace 版（CONFIG_FUNCTION_TRACER 未启用）均死路。本版只直接引用
@@ -42,6 +45,10 @@ MODULE_PARM_DESC(ksu_path, "exec path prefix that triggers root grant");
 /* 状态标记：init/hook 每步更新，cat /sys/module/ksu_lkm_sct/parameters/diag_state 查看 */
 static char *diag_state = "0-init-not-run";
 module_param(diag_state, charp, 0444);
+
+/* 记录 hook 实际写入方式：alias / patch / none */
+static char *hook_method = "none";
+module_param(hook_method, charp, 0444);
 
 /* 触发参数：MTK 内核不调用模块 init（实测 mod->init 失效），
  * 但模块参数解析（parse_args）正常 → 把 hook 初始化挂到参数 set 回调，
@@ -75,6 +82,19 @@ static syscall_fn_t orig_sys_execve;
 static prepare_kernel_cred_t p_prepare_kernel_cred;
 static commit_creds_t p_commit_creds;
 static syscall_fn_t *sct; /* sys_call_table */
+
+/* ---- diag_state 格式化（带缓冲，失败时给出具体位置） ---- */
+static char diag_buf[192];
+
+static void diag_set(const char *fmt, ...)
+{
+	va_list args;
+
+	va_start(args, fmt);
+	vsnprintf(diag_buf, sizeof(diag_buf), fmt, args);
+	va_end(args);
+	diag_state = diag_buf;
+}
 
 /* ---- 写文件诊断（辅助通道，/sys diag_state 为主） ---- */
 static void diag_log(const char *fmt, ...)
@@ -161,133 +181,182 @@ static syscall_fn_t *find_sys_call_table(void)
 	return NULL;
 }
 
-/* ---- 遍历内核页表（TTBR1_EL1 + ioremap_cache） ----
- * 返回: 1 = PTE（*out=值）；0 = huge pmd；-1 = 失败。 */
-static int walk_pte(unsigned long addr, u64 *out)
+/* ---- 遍历内核页表（TTBR1_EL1，ioremap 读表） ----
+ * 返回: 1 = 4K PTE（*pte_out=PTE 值，*phys_out=页物理基址）
+ *       0 = 2MB block（*pte_out=块描述符，*phys_out=含块内偏移的物理地址）
+ *      -1 = 失败（diag_state 已给出具体原因） */
+static int walk_va(unsigned long va, u64 *pte_out, u64 *phys_out)
 {
 	u64 ttbr1, e;
 	u64 *tbl;
 
 	asm volatile("mrs %0, ttbr1_el1" : "=r"(ttbr1));
 
-	tbl = (u64 *)ioremap_cache(ttbr1 & PHYS_MASK, PAGE_SIZE);
+	tbl = (u64 *)ioremap_cache(ttbr1 & PHYS_MASK & PAGE_MASK, PAGE_SIZE);
 	if (!tbl) {
-		diag_log("walk: pgd ioremap fail\n");
+		diag_set("W-pgd-remap-fail");
 		return -1;
 	}
-	e = tbl[pgd_index(addr)];
+	e = tbl[pgd_index(va)];
 	iounmap(tbl);
 	if ((e & 3) != 3) {
-		diag_log("walk: pgd bad 0x%llx\n", e);
+		diag_set("W-pgd-bad=%llx", e);
 		return -1;
 	}
 
 #if CONFIG_PGTABLE_LEVELS >= 4
-	tbl = (u64 *)ioremap_cache(e & PHYS_MASK, PAGE_SIZE);
+	tbl = (u64 *)ioremap_cache(e & PHYS_MASK & PAGE_MASK, PAGE_SIZE);
 	if (!tbl) {
-		diag_log("walk: pud ioremap fail\n");
+		diag_set("W-pud-remap-fail");
 		return -1;
 	}
-	e = tbl[pud_index(addr)];
+	e = tbl[pud_index(va)];
 	iounmap(tbl);
 	if ((e & 3) != 3) {
-		diag_log("walk: pud bad 0x%llx\n", e);
+		diag_set("W-pud-bad=%llx", e);
 		return -1;
 	}
 #endif
 
-	tbl = (u64 *)ioremap_cache(e & PHYS_MASK, PAGE_SIZE);
+	tbl = (u64 *)ioremap_cache(e & PHYS_MASK & PAGE_MASK, PAGE_SIZE);
 	if (!tbl) {
-		diag_log("walk: pmd ioremap fail\n");
+		diag_set("W-pmd-remap-fail");
 		return -1;
 	}
-	e = tbl[pmd_index(addr)];
+	e = tbl[pmd_index(va)];
 	iounmap(tbl);
 	if ((e & 3) == 0) {
-		diag_log("walk: pmd none 0x%llx\n", e);
+		diag_set("W-pmd-none=%llx", e);
 		return -1;
 	}
-	if ((e & 3) == 1) { /* huge block */
-		if (out)
-			*out = e;
+	if ((e & 3) == 1) { /* 2MB block */
+		if (pte_out)
+			*pte_out = e;
+		if (phys_out)
+			*phys_out = (e & PHYS_MASK & ~((1UL << 21) - 1)) |
+				    (va & ((1UL << 21) - 1));
 		return 0;
 	}
 
-	tbl = (u64 *)ioremap_cache(e & PHYS_MASK, PAGE_SIZE);
+	tbl = (u64 *)ioremap_cache(e & PHYS_MASK & PAGE_MASK, PAGE_SIZE);
 	if (!tbl) {
-		diag_log("walk: pte ioremap fail\n");
+		diag_set("W-pte-remap-fail");
 		return -1;
 	}
-	e = tbl[pte_index(addr)];
+	e = tbl[pte_index(va)];
 	iounmap(tbl);
 	if ((e & 3) == 0) {
-		diag_log("walk: pte none 0x%llx\n", e);
+		diag_set("W-pte-none=%llx", e);
 		return -1;
 	}
-	if (out)
-		*out = e;
+	if (pte_out)
+		*pte_out = e;
+	if (phys_out)
+		*phys_out = (e & PHYS_MASK & PAGE_MASK);
 	return 1;
 }
 
-static int va_writable(unsigned long addr)
+/* ---- 写入：ioremap 物理页别名（新 RW 映射，绕开原映射的 RO 权限） ---- */
+static int write_via_alias(unsigned long va, syscall_fn_t fn)
 {
-	u64 pteval = 0;
-	int r = walk_pte(addr, &pteval);
+	u64 pte = 0, phys = 0;
+	syscall_fn_t *t;
+	void *m;
+	int r = walk_va(va, &pte, &phys);
 
-	if (r == 1)
-		return (pteval & PTE_WRITE) != 0;
-	if (r == 0)
-		return (pteval & PTE_WRITE) != 0;
-	return 0;
+	if (r < 0)
+		return 0; /* walk 失败时 diag_state 已设置 */
+
+	m = ioremap_cache(phys & PAGE_MASK, PAGE_SIZE);
+	if (!m) {
+		diag_set("5a-remap-fail phys=%llx", phys);
+		return 0;
+	}
+	t = (syscall_fn_t *)((char *)m + (va & (PAGE_SIZE - 1)));
+	WRITE_ONCE(*t, fn);
+	if (*t != fn) {
+		diag_set("5a-verify-fail phys=%llx", phys);
+		iounmap(m);
+		return 0;
+	}
+	iounmap(m);
+	hook_method = "alias";
+	return 1;
 }
 
-/* ---- PTE 补丁：AP[2:1] = 00（EL1 RW）+ flush TLB ---- */
-static int make_va_writable(unsigned long addr)
+/* ---- AP[2:1] 补丁（兜底）：AP=00 -> EL1 RW + flush TLB，4K 和 2MB block 都支持 ---- */
+static int make_va_writable(unsigned long va)
 {
 	u64 ttbr1, e;
 	u64 *tbl;
 
 	asm volatile("mrs %0, ttbr1_el1" : "=r"(ttbr1));
 
-	tbl = (u64 *)ioremap_cache(ttbr1 & PHYS_MASK, PAGE_SIZE);
-	if (!tbl)
+	tbl = (u64 *)ioremap_cache(ttbr1 & PHYS_MASK & PAGE_MASK, PAGE_SIZE);
+	if (!tbl) {
+		diag_set("5b-pgd-remap-fail");
 		return 0;
-	e = tbl[pgd_index(addr)];
+	}
+	e = tbl[pgd_index(va)];
 	iounmap(tbl);
-	if ((e & 3) != 3)
+	if ((e & 3) != 3) {
+		diag_set("5b-pgd-bad=%llx", e);
 		return 0;
+	}
 
 #if CONFIG_PGTABLE_LEVELS >= 4
-	tbl = (u64 *)ioremap_cache(e & PHYS_MASK, PAGE_SIZE);
-	if (!tbl)
+	tbl = (u64 *)ioremap_cache(e & PHYS_MASK & PAGE_MASK, PAGE_SIZE);
+	if (!tbl) {
+		diag_set("5b-pud-remap-fail");
 		return 0;
-	e = tbl[pud_index(addr)];
+	}
+	e = tbl[pud_index(va)];
 	iounmap(tbl);
-	if ((e & 3) != 3)
+	if ((e & 3) != 3) {
+		diag_set("5b-pud-bad=%llx", e);
 		return 0;
+	}
 #endif
 
-	tbl = (u64 *)ioremap_cache(e & PHYS_MASK, PAGE_SIZE);
-	if (!tbl)
+	tbl = (u64 *)ioremap_cache(e & PHYS_MASK & PAGE_MASK, PAGE_SIZE);
+	if (!tbl) {
+		diag_set("5b-pmd-remap-fail");
 		return 0;
-	e = tbl[pmd_index(addr)];
+	}
+	e = tbl[pmd_index(va)];
 	iounmap(tbl);
-	if ((e & 3) != 3) /* huge 不支持 */
+	if ((e & 3) == 0) {
+		diag_set("5b-pmd-none=%llx", e);
 		return 0;
+	}
 
-	tbl = (u64 *)ioremap_cache(e & PHYS_MASK, PAGE_SIZE);
-	if (!tbl)
-		return 0;
-	tbl[pte_index(addr)] &= ~(3UL << 6); /* AP[2:1] = 00 -> EL1 RW */
-	iounmap(tbl);
+	if ((e & 3) == 1) { /* 2MB block：改块描述符 AP */
+		tbl = (u64 *)ioremap_cache(e & PHYS_MASK & PAGE_MASK, PAGE_SIZE);
+		if (!tbl) {
+			diag_set("5b-block-remap-fail");
+			return 0;
+		}
+		tbl[pmd_index(va)] &= ~(3UL << 6); /* AP[2:1] = 00 */
+		iounmap(tbl);
+		diag_set("5b-block-patched pmd=%llx", e);
+	} else { /* 4K PTE */
+		tbl = (u64 *)ioremap_cache(e & PHYS_MASK & PAGE_MASK, PAGE_SIZE);
+		if (!tbl) {
+			diag_set("5b-pte-remap-fail");
+			return 0;
+		}
+		tbl[pte_index(va)] &= ~(3UL << 6); /* AP[2:1] = 00 */
+		iounmap(tbl);
+		diag_set("5b-pte-patched");
+	}
 
-	flush_tlb_kernel_range(addr, addr + PAGE_SIZE);
-	diag_log("PTE patched writable @0x%lx\n", addr);
+	flush_tlb_kernel_range(va, va + PAGE_SIZE);
 	return 1;
 }
 
 /* ---- hook: arm64 syscall 表项签名 fn(const struct pt_regs *) ---- */
 static int diag_once;
+
 static long ksu_sys_execve(const struct pt_regs *regs)
 {
 	const char __user *filename = (const char __user *)regs->regs[0];
@@ -361,35 +430,27 @@ static int ksu_hook_init(void)
 	}
 	diag_state = "3-sct-verified";
 
-	r = va_writable((unsigned long)&sct[NR_EXECVE]);
-	diag_log("va_writable=%d\n", r);
-	if (!r) {
-		diag_state = "4-patching";
-		if (!make_va_writable((unsigned long)&sct[NR_EXECVE])) {
-			diag_state = "4-patch-failed";
-			diag_log("PTE patch failed, hook disabled\n");
-			return 0;
-		}
-		if (!va_writable((unsigned long)&sct[NR_EXECVE])) {
-			diag_state = "4-still-ro";
-			diag_log("still not writable after patch\n");
-			return 0;
-		}
-		diag_state = "4-patched";
-		diag_log("PTE patch verified writable\n");
-	} else {
-		diag_state = "4-writable";
-	}
-
-	WRITE_ONCE(sct[NR_EXECVE], ksu_sys_execve);
-	if (sct[NR_EXECVE] != ksu_sys_execve) {
-		diag_state = "4-verify-failed";
-		diag_log("write verify FAILED\n");
+	/* 1) 首选：ioremap 物理页别名写（绕开 RO 映射，不改页权限） */
+	r = write_via_alias((unsigned long)&sct[NR_EXECVE], ksu_sys_execve);
+	if (r && sct[NR_EXECVE] == ksu_sys_execve) {
+		diag_log("HOOK OK via %s: sct[%d] -> %ps, trigger=%s\n",
+			 hook_method, NR_EXECVE, ksu_sys_execve, ksu_path);
+		diag_state = "5-hooked";
 		return 0;
 	}
-	diag_state = "5-hooked";
-	diag_log("HOOK OK: sct[%d] -> %ps, trigger=%s\n",
-		 NR_EXECVE, ksu_sys_execve, ksu_path);
+
+	/* 2) 兜底：AP[2:1] 补丁后直接写 */
+	if (make_va_writable((unsigned long)&sct[NR_EXECVE])) {
+		WRITE_ONCE(sct[NR_EXECVE], ksu_sys_execve);
+		if (sct[NR_EXECVE] == ksu_sys_execve) {
+			hook_method = "patch";
+			diag_state = "5-hooked";
+			return 0;
+		}
+		diag_state = "5b-verify-fail";
+		return 0;
+	}
+	/* make_va_writable 内部已设具体失败原因 */
 	return 0;
 }
 
@@ -410,5 +471,5 @@ module_exit(ksu_sct_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("DS");
-MODULE_DESCRIPTION("KSU root grant via sys_call_table execve hook (4.14 MT6771)");
-MODULE_VERSION("0.8");
+MODULE_DESCRIPTION("KSL root grant via sys_call_table execve hook (4.14 MT6771)");
+MODULE_VERSION("0.9");

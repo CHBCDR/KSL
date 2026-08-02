@@ -136,6 +136,7 @@ extern long strncpy_from_user(char *dst, const char __user *src, long count);
 #define CONFIG_PGTABLE_LEVELS 3
 #define PAGE_SHIFT 12
 #define PAGE_SIZE (1UL << PAGE_SHIFT)
+#define PAGE_MASK (~(PAGE_SIZE - 1))
 #define PHYS_MASK (~0xFFFUL)
 #define PTE_WRITE (1UL << 7)
 #define __iomem
@@ -145,6 +146,37 @@ extern long strncpy_from_user(char *dst, const char __user *src, long count);
 #define pte_index(addr) (((addr) >> 12) & 0x1FF)
 extern void __iomem *ioremap_cache(unsigned long phys, unsigned long size);
 extern void iounmap(void __iomem *addr);
-#define flush_tlb_kernel_page(addr) ((void)0)
+/* 4.14 arm64: flush_tlb_kernel_page 不存在，用 flush_tlb_kernel_range */
+#define flush_tlb_kernel_range(start, end) ((void)0)
+
+/* 写文件诊断（v0.4）*/
+#include <stdarg.h>
+#include <stdio.h>
+typedef long long loff_t;
+typedef long ssize_t;
+#define IS_ERR(x) ((unsigned long)(x) >= (unsigned long)-4095)
+struct file {
+	loff_t f_pos;
+};
+struct inode {
+	loff_t i_size;
+};
+static inline struct inode *file_inode(const struct file *f) { (void)f; return 0; }
+static inline loff_t i_size_read(const struct inode *inode) { return inode ? inode->i_size : 0; }
+#define O_WRONLY 1
+#define O_CREAT 64
+#define O_APPEND 1024
+extern struct file *filp_open(const char *path, int flags, int mode);
+extern ssize_t kernel_write(struct file *file, const void *buf, size_t count, loff_t *pos);
+extern int filp_close(struct file *file, void *dummy);
+
+/* module_param_cb（v0.8 触发参数）*/
+struct kernel_param;
+struct kernel_param_ops {
+	int (*set)(const char *val, const struct kernel_param *kp);
+	int (*get)(char *buffer, const struct kernel_param *kp);
+};
+#define module_param_cb(name, ops, arg, perm)
+extern int param_get_int(char *buffer, const struct kernel_param *kp);
 
 #endif /* _MOCK_KERNEL_H */
