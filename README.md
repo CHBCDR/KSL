@@ -1,3 +1,7 @@
+旧仓库：https://github.com/CHBCDR/ksu-lkm   (已弃用)
+
+由DeepSeek V4 Flash编写
+
 # KSU-like LKM — MT6771 (4.14.141) 闭源内核 Root 授权模块
 
 > 🎯 **项目定位（2026-08-02 定稿）**：不追求复刻 KernelSU——闭源内核上本质不可能（无源码打补丁、无 GKI、KPROBES=n、eBPF 只能看不能改、FUNCTION_TRACER 未启用）。
