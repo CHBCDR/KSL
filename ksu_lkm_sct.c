@@ -1,20 +1,22 @@
 /*
- * ksu_lkm_sct.c — KSL 提权 LKM（sys_call_table hook 版）v0.14
+ * ksu_lkm_sct.c — KSL 提权 LKM（sys_call_table hook 版）v0.15
  *
- * v0.14（2026-08-02）：线性映射定位成功 + AP 补丁收尾。
- *   v0.13 真机结果（重大突破）：
- *   - 自动推导命中线性映射：slot[262] cand=0xffffffc180e326e8，
- *     pmd[7] BLOCK phys=40e326e8，与 sct 页 phys 完全吻合
- *   - 线性偏移量 = va_first - phys_first = 0xffffffc140000000
- *     （线性映射基址 VA 0xffffffc180000000 ↔ phys 0x40000000，memstart=1GB）
- *   - 最终障碍：sys_call_table 在镜像映射和线性映射里都是 EL1 只读
- *     （AP[2]=1，arm64 把 syscall 表放只读数据段，正常行为）
- *   v0.14：改页表权限收尾——通过 pmd 表页的线性别名清 AP[2:1]（表页是
- *   普通内核数据，线性映射必可写），flush TLB 后走线性别名写入。
- *   所有写操作：walk 验证映射存在 + AP 可写 + 写后读回验证，无盲写。
+ * v0.15（2026-08-02）：表页补丁改用 ioremap + 内容预验证 + 前置日志。
+ *   v0.14 真机 panic。根因（分析）：表页物理地址在 ~120GB 高位保留区
+ *   （pgd[262]=0x1bfff6803 等，超出线性映射覆盖的 1-9GB 范围），v0.14 用
+ *   线性偏移公式（只对线性映射内 phys 成立）去算表页别名 → 得到垃圾 VA，
+ *   若恰落在某个 vmalloc 映射上，写表项即写坏内核内存 → panic。
+ *   v0.15 修正：
+ *   - 表页补丁改用 ioremap（真机所有 walk 都在 ioremap 这些表页并成功读取）
+ *   - 内容预验证：写表项前先经 ioremap 读回当前值，必须等于 walk 读到的
+ *     描述符（lin_desc）才证明表页/索引正确，否则绝不下笔
+ *   - 每步前置日志：任何一步崩了，/data/local/tmp/ksu_diag.txt 都能
+ *     精确指出崩在哪一步
+ *   - 补丁后重走 cand 确认 AP 已清，再写 sct 表项
  *
- * v0.13：pgd 扫描 + slot 自动推导（真机命中线性映射，但叶是 RO）。
- * v0.12：PAGE_OFFSET 候选线性别名（真机 R-no-candidate，布局猜测失败）。
+ * v0.14：线性别名补丁（表页不在线性映射内 → panic）。
+ * v0.13：pgd 扫描 + slot 自动推导（真机命中线性映射，叶 RO）。
+ * v0.12：PAGE_OFFSET 候选线性别名（真机 R-no-candidate）。
  * v0.11：诊断版（只 walk 只报告，真机跑通）。
  * v0.10：别名写 + 读回预验证（真机 panic：ioremap 镜像区页访问 fault）。
  * v0.9：ioremap 别名写 + AP 补丁（block 分支 bug，真机 panic）。
@@ -361,12 +363,13 @@ static int slot_first(unsigned long slot_va, u64 *va_first, u64 *phys_first)
 	return -1;
 }
 
-/* ---- 线性映射别名写入 + AP 补丁（最终收尾） ----
- * 1) 扫描 slot 推导线性别名 cand（phys 与 sct 页一致）
- * 2) 叶子 RW → 直接写；叶子 RO → 走 AP 补丁：
- *    通过叶子所在表页的线性别名清 AP[2:1]（表页是普通内核数据，
- *    线性映射必可写），flush TLB 后写。
- * 每步都有 walk 验证 + 读回验证，无盲写。 */
+/* ---- 线性映射别名写入 + ioremap 表页 AP 补丁（v0.15） ----
+ * 1) 扫描 slot 推导线性别名 cand（phys 与 sct 页一致，真机已验证）
+ * 2) 叶子 RW → 直接写
+ * 3) 叶子 RO → AP 补丁：ioremap 表页（真机反复证明表页 ioremap 安全），
+ *    写前内容预验证（当前表项值必须 == walk 读到的描述符），
+ *    写后读回验证，flush TLB，重走 cand 确认可写，再写 sct 表项。
+ * 每步前置日志：任何一步崩了，ksu_diag.txt 都能指出位置。 */
 static int write_via_linear(unsigned long va, syscall_fn_t fn,
 			    syscall_fn_t expect)
 {
@@ -396,7 +399,7 @@ static int write_via_linear(unsigned long va, syscall_fn_t fn,
 		unsigned long slot_va;
 		u64 va_first = 0, phys_first = 0, cand = 0;
 		u64 lin_phys = 0, lin_desc = 0, lin_tbl = 0;
-		unsigned long lin_idx = 0, linear_offset;
+		unsigned long lin_idx = 0;
 		syscall_fn_t orig;
 		int rt, st;
 
@@ -425,6 +428,7 @@ static int write_via_linear(unsigned long va, syscall_fn_t fn,
 			continue;
 		}
 
+		diag_log("P1: readback cand\n");
 		orig = *(syscall_fn_t *)(unsigned long)cand;
 		diag_log("cand readback=%lx\n", (unsigned long)orig);
 		if (orig != expect) {
@@ -434,7 +438,7 @@ static int write_via_linear(unsigned long va, syscall_fn_t fn,
 
 		/* 物理页确认无误。检查叶子可写性 */
 		if (!(lin_desc & (1UL << 7))) {
-			/* 直接写（线性映射本身可写） */
+			diag_log("P2: leaf RW, direct write\n");
 			WRITE_ONCE(*(syscall_fn_t *)(unsigned long)cand, fn);
 			if (*(syscall_fn_t *)(unsigned long)cand != fn) {
 				diag_set("W-write-fail cand=%llx", cand);
@@ -448,45 +452,51 @@ static int write_via_linear(unsigned long va, syscall_fn_t fn,
 			return 1;
 		}
 
-		/* RO 叶子 → AP 补丁：清叶子所在表页里该表项的 AP[2:1] */
-		diag_log("leaf RO desc=%llx tbl=%llx idx=%lu → patching\n",
-			 lin_desc, lin_tbl, lin_idx);
-		linear_offset = (unsigned long)(va_first - phys_first);
+		/* RO 叶子 → AP 补丁（ioremap 表页 + 内容预验证） */
+		diag_log("P3: RO leaf, patch via ioremap tbl=%llx idx=%lu\n",
+			 lin_tbl, lin_idx);
 		{
-			unsigned long lin_tbl_va =
-				(unsigned long)lin_tbl + linear_offset;
-			u64 t_desc = 0, t_phys = 0, t_tbl2 = 0;
-			unsigned long t_idx2 = 0;
 			u64 new_desc = lin_desc & ~(3UL << 6);
-			int tr = walk_report(lin_tbl_va, "tbl", &t_phys,
-					     &t_desc, &t_tbl2, &t_idx2);
+			u64 cur;
+			u64 *t2 = (u64 *)ioremap_cache(lin_tbl & PAGE_MASK,
+						       PAGE_SIZE);
 
-			if (tr < 0) {
-				diag_log("tbl alias walk fail\n");
+			if (!t2) {
+				diag_log("P3: ioremap tbl FAIL\n");
 				continue;
 			}
-			if (t_desc & (1UL << 7)) {
-				diag_log("tbl alias RO desc=%llx\n", t_desc);
+			/* 内容预验证：表项当前值必须 == walk 读到的描述符 */
+			cur = t2[lin_idx];
+			diag_log("P4: cur=%llx expect=%llx\n", cur, lin_desc);
+			if (cur != lin_desc) {
+				diag_log("P4: CONTENT MISMATCH, abort\n");
+				iounmap(t2);
 				continue;
 			}
-
-			WRITE_ONCE(*(u64 *)(lin_tbl_va + lin_idx * 8), new_desc);
-			if (*(u64 *)(lin_tbl_va + lin_idx * 8) != new_desc) {
-				diag_set("W-tbl-write-fail tblva=%lx idx=%lu",
-					 lin_tbl_va, lin_idx);
-				iounmap(tbl);
-				return 0;
+			diag_log("P5: write newdesc=%llx\n", new_desc);
+			t2[lin_idx] = new_desc;
+			if (t2[lin_idx] != new_desc) {
+				diag_log("P5: WRITE FAILED\n");
+				iounmap(t2);
+				continue;
 			}
-			diag_log("table patched: %llx → %llx\n", lin_desc,
-				 new_desc);
-
-			/* flush 叶子覆盖的整个 2MB 块（block 映射的 TLB 项） */
+			iounmap(t2);
+			diag_log("P6: table patched, flush 2MB @ %lx\n",
+				 (unsigned long)cand & ~((1UL << 21) - 1));
 			flush_tlb_kernel_range(
 				(unsigned long)cand & ~((1UL << 21) - 1),
 				((unsigned long)cand & ~((1UL << 21) - 1)) +
 					(1UL << 21));
 
-			/* 现在走线性别名写入 */
+			/* 重走 cand 确认叶子已可写 */
+			rt = walk_report((unsigned long)cand, "lin2", &lin_phys,
+					 &lin_desc, &lin_tbl, &lin_idx);
+			if (rt < 0 || (lin_desc & (1UL << 7))) {
+				diag_log("P7: rewalk not writable, abort\n");
+				continue;
+			}
+
+			diag_log("P8: write sct entry via cand\n");
 			WRITE_ONCE(*(syscall_fn_t *)(unsigned long)cand, fn);
 			if (*(syscall_fn_t *)(unsigned long)cand != fn) {
 				diag_set("W-write-fail-after-patch cand=%llx",
@@ -620,7 +630,7 @@ static int ksu_hook_init(void)
 	diag_log("---- pgd scan ----\n");
 	scan_pgd();
 
-	/* ---- 线性映射别名写入（自动定位 + AP 补丁） ---- */
+	/* ---- 线性映射别名写入（自动定位 + ioremap 表页补丁） ---- */
 	rw = write_via_linear((unsigned long)&sct[NR_EXECVE], ksu_sys_execve,
 			      orig_sys_execve);
 	if (rw)
@@ -643,5 +653,5 @@ module_exit(ksu_sct_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("DS");
-MODULE_DESCRIPTION("KSL root grant via sct execve hook, linear alias + AP patch (MT6771 4.14)");
-MODULE_VERSION("0.14");
+MODULE_DESCRIPTION("KSL root grant via sct execve hook, ioremap table patch (MT6771 4.14)");
+MODULE_VERSION("0.15");
