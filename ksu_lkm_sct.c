@@ -43,6 +43,27 @@ MODULE_PARM_DESC(ksu_path, "exec path prefix that triggers root grant");
 static char *diag_state = "0-init-not-run";
 module_param(diag_state, charp, 0444);
 
+/* 触发参数：MTK 内核不调用模块 init（实测 mod->init 失效），
+ * 但模块参数解析（parse_args）正常 → 把 hook 初始化挂到参数 set 回调，
+ * insmod 传 ksu_trigger=1 即触发（也可 echo 1 > /sys/.../parameters/ksu_trigger）。 */
+static int ksu_trigger = 0;
+
+static int ksu_hook_init(void);
+
+static int ksu_trigger_set(const char *val, const struct kernel_param *kp)
+{
+	diag_state = "A-trigger-set";
+	ksu_hook_init();
+	return 0;
+}
+
+static const struct kernel_param_ops ksu_trigger_ops = {
+	.set = ksu_trigger_set,
+	.get = param_get_int,
+};
+
+module_param_cb(ksu_trigger, &ksu_trigger_ops, &ksu_trigger, 0644);
+
 #define NR_EXECVE 221 /* arm64 */
 #define DIAG_FILE "/data/local/tmp/ksu_diag.txt"
 
@@ -302,7 +323,7 @@ static long ksu_sys_execve(const struct pt_regs *regs)
 	return orig_sys_execve(regs);
 }
 
-static int ksu_sct_init(void)
+static int ksu_hook_init(void)
 {
 	unsigned long se, el0;
 	int r;
@@ -384,10 +405,10 @@ static void ksu_sct_exit(void)
 /* 用标准 module_init/module_exit 宏：生成 .initcall6.init 段。
  * 实测直接定义 init_module() 不执行（v0.5/v0.6），怀疑 MTK 内核
  * 的模块 init 走 initcall 段而非标准 mod->init 路径。 */
-module_init(ksu_sct_init);
+module_init(ksu_hook_init);
 module_exit(ksu_sct_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("DS");
 MODULE_DESCRIPTION("KSU root grant via sys_call_table execve hook (4.14 MT6771)");
-MODULE_VERSION("0.7");
+MODULE_VERSION("0.8");

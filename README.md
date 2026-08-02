@@ -1,8 +1,8 @@
-旧仓库：https://github.com/CHBCDR/ksu-lkm   (已弃用)
-
-由DeepSeek V4 Flash编写
-
 # KSU-like LKM — MT6771 (4.14.141) 闭源内核 Root 授权模块
+
+旧仓库：[https://github.com/CHBCDR/ksu-lkm]  （已弃用，2026-08-02 改名 KSL）
+
+由 DeepSeek V4 Flash 编写
 
 > 🎯 **项目定位（2026-08-02 定稿）**：不追求复刻 KernelSU——闭源内核上本质不可能（无源码打补丁、无 GKI、KPROBES=n、eBPF 只能看不能改、FUNCTION_TRACER 未启用）。
 > 目标是自研 **KSU-like** 最小内核授权：LKM 加载 + 内核态提权 + 轻量 su 接口。**验收标准是"机制能跑"，不是"像 KSU"。** 不做 Manager app / overlayfs / 模块管理。
@@ -46,16 +46,20 @@
 ```sh
 adb push ksu_lkm_sct.ko kload /data/local/tmp/
 
-# kload v2 带 flags，跳过 MODVERSIONS CRC / vermagic（toybox insmod 不认 -f，必须用 kload）
-su -c '/data/local/tmp/kload'   # 应显示 "kload v2" 版本行
-su -c '/data/local/tmp/kload /data/local/tmp/ksu_lkm_sct.ko ksu_path=/data/local/tmp/ksu'
+# 加载：toybox insmod 走 init_module（MTK 魔改只认 init_module，finit_module 被静默拒绝）
+# ⚠️ 必须带 ksu_trigger=1：MTK 不调用模块 init，hook 初始化挂在参数回调上，不带就永远不生效
+su -c 'insmod /data/local/tmp/ksu_lkm_sct.ko ksu_path=/data/local/tmp/ksu ksu_trigger=1'
+# 若报 CRC/vermagic 错，退回 kload（跳过 MODVERSIONS）：
+#   su -c '/data/local/tmp/kload /data/local/tmp/ksu_lkm_sct.ko ksu_path=/data/local/tmp/ksu ksu_trigger=1'
 
-# 确认 hook 成功（应看到 sct=0x... execve hooked）
-su -c 'dmesg | grep ksu_sct'
+# 确认 hook 成功（dmesg 被 wlan 刷屏不可靠，看 diag_state 参数节点）
+su -c 'cat /sys/module/ksu_lkm_sct/parameters/diag_state'   # 期望 5-hooked
 
-# 触发提权测试（注意：shell 本身是 Magisk root，必须用普通用户触发，否则假阳性）
-su -c 'cp /system/bin/sh /data/local/tmp/ksu && /data/local/tmp/ksu -c id'
+# 触发提权测试（⚠️ shell 本身是 Magisk root，直接跑是假阳性，必须 uid 2000 触发）
+su -c 'cp /system/bin/sh /data/local/tmp/ksu'
+su 2000 -c '/data/local/tmp/ksu -c id'
 # 期望输出: uid=0(root) gid=0(root) ...
+su -c 'cat /sys/module/ksu_lkm_sct/parameters/diag_state'   # 期望 8-root-granted
 ```
 
 卸载：
