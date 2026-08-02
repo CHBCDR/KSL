@@ -1,8 +1,7 @@
-旧仓库：https://github.com/CHBCDR/ksu-lkm     (已弃用)
+# KSU-like LKM — MT6771 (4.14.141) 闭源内核 Root 授权模块
 
-由DeepSeek V4 Flash编写
-
-# KSU LKM — MT6771 (4.14.141) 闭源内核 Root 授权模块
+> 🎯 **项目定位（2026-08-02 定稿）**：不追求复刻 KernelSU——闭源内核上本质不可能（无源码打补丁、无 GKI、KPROBES=n、eBPF 只能看不能改、FUNCTION_TRACER 未启用）。
+> 目标是自研 **KSU-like** 最小内核授权：LKM 加载 + 内核态提权 + 轻量 su 接口。**验收标准是"机制能跑"，不是"像 KSU"。** 不做 Manager app / overlayfs / 模块管理。
 
 **当前主力：`ksu_lkm_sct.c` — sys_call_table hook 版**（真机可用路线）。
 
@@ -60,7 +59,7 @@ su -c 'cp /system/bin/sh /data/local/tmp/ksu && /data/local/tmp/ksu -c id'
 su -c 'rmmod ksu_lkm_sct'
 ```
 
-## 故障排查速查（2026-08-01 实测）
+## 故障排查（2026-08-01 实测）
 
 | 现象 | 病因 |
 |---|---|
@@ -72,9 +71,9 @@ su -c 'rmmod ksu_lkm_sct'
 
 ## 已知限制 / TODO
 
-- **SELinux**：只改 cred 不过 SELinux 域。enforcing 下提权进程仍属原域，部分操作会被拒。完整 KSU 需 hook selinux 检查（后续做）
+- **SELinux**：只改 cred 不过 SELinux 域。enforcing 下提权进程仍属原域，部分操作会被拒。KSU-like 范围不强制 hook selinux 检查（以后需要再说）
 - 若 sys_call_table 页被证实 RO：需 PTE 补丁（改 AP 位）后重试，模块已预留检测逻辑
-- 触发方式是"路径白名单"，还不是完整 KSU 的 su 管理器架构——先验证机制，再叠功能
+- 触发方式是"路径白名单"——KSU-like 的最小实现，先验证机制，再按需叠 uid/comm 白名单和 su 接口
 
 ## 验证记录
 
