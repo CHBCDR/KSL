@@ -1,17 +1,16 @@
 /*
- * ksu_lkm_sct.c — KSL 提权 LKM（sys_call_table hook 版）v0.10
+ * ksu_lkm_sct.c — KSL 提权 LKM（sys_call_table hook 版）v0.11 诊断版
  *
- * v0.10 变更（2026-08-02）：
- *   v0.9 真机 panic（死机重启）。根因：make_va_writable 的 2MB block 分支
- *   用 block 描述符当页表地址 remap（block 的 bit[20:12] 是保留位），
- *   写到了内核镜像自身内存 → 内核崩溃。同时说明：sct 页确实是 2MB block
- *   映射（walk 到 pmd 级为 block），且别名写在真机上未走通。
- *   - 删除 AP 补丁兜底（不再有任何改页表/写未知地址的操作）
- *   - 别名写加"写前读回预验证"：先从新映射读回原值，必须等于预期值
- *     （sys_execve）才证明物理地址正确，否则绝不下笔 → 不可能写坏内存
- *   - 失败一律安全报告，不再尝试高风险路径
+ * v0.11（2026-08-02）：诊断专用，只报告、绝不写入。
+ *   v0.9/v0.10 真机连续 panic 两次，共同点：都在访问 walk 算出的物理页时崩溃
+ *   （v0.10 崩在写前读回预验证的读取本身）。v0.8 证明读页表（ioremap 表页+读表项）
+ *   安全，但按 walk 结果访问 phys 会崩 → 怀疑 walk 在真机上返回了错误物理地址。
+ *   本版：加载后只 walk + 报告所有表项和 phys，不做任何内存写入；
+ *   加 sys_execve 文本地址交叉验证（内核镜像连续映射 → phys 差 == va 差，
+ *   不等则 walk 布局有问题）。拿到真实数据后再设计写入方案。
  *
- * v0.9：ioremap 别名写 + AP 补丁（block 分支有 bug，真机 panic）。
+ * v0.10：别名写 + 写前读回预验证（真机仍 panic，崩在预验证读取）。
+ * v0.9：ioremap 别名写 + AP 补丁（block 分支 bug，真机 panic）。
  * v0.8：module_param_cb(ksu_trigger) 触发 hook 初始化（MTK 不调 module init）。
  * v0.6：diag_state /sys 参数节点状态标记。
  * v0.5：直接定义 int init_module(void)。
@@ -48,12 +47,12 @@ MODULE_PARM_DESC(ksu_path, "exec path prefix that triggers root grant");
 static char *diag_state = "0-init-not-run";
 module_param(diag_state, charp, 0444);
 
-/* 记录 hook 实际写入方式：alias / patch / none */
+/* 记录 hook 实际写入方式（本版无写入，恒为 none） */
 static char *hook_method = "none";
 module_param(hook_method, charp, 0444);
 
 /* 触发参数：MTK 内核不调用模块 init（实测 mod->init 失效），
- * 但模块参数解析（parse_args）正常 → 把 hook 初始化挂到参数 set 回调，
+ * 但模块参数解析（parse_args）正常 → 把诊断初始化挂到参数 set 回调，
  * insmod 传 ksu_trigger=1 即触发（也可 echo 1 > /sys/.../parameters/ksu_trigger）。 */
 static int ksu_trigger = 0;
 
@@ -85,20 +84,7 @@ static prepare_kernel_cred_t p_prepare_kernel_cred;
 static commit_creds_t p_commit_creds;
 static syscall_fn_t *sct; /* sys_call_table */
 
-/* ---- diag_state 格式化（带缓冲，失败时给出具体位置） ---- */
-static char diag_buf[192];
-
-static void diag_set(const char *fmt, ...)
-{
-	va_list args;
-
-	va_start(args, fmt);
-	vsnprintf(diag_buf, sizeof(diag_buf), fmt, args);
-	va_end(args);
-	diag_state = diag_buf;
-}
-
-/* ---- 写文件诊断（辅助通道，/sys diag_state 为主） ---- */
+/* ---- 写文件诊断（每次打开追加，SELinux 可能拦，/sys diag_state 为主） ---- */
 static void diag_log(const char *fmt, ...)
 {
 	struct file *f;
@@ -121,6 +107,20 @@ static void diag_log(const char *fmt, ...)
 		kernel_write(f, buf, n, &pos);
 	}
 	filp_close(f, NULL);
+}
+
+/* ---- diag_state 格式化（带缓冲），同步写文件，panic 后可从文件定位最后一步 ---- */
+static char diag_buf[192];
+
+static void diag_set(const char *fmt, ...)
+{
+	va_list args;
+
+	va_start(args, fmt);
+	vsnprintf(diag_buf, sizeof(diag_buf), fmt, args);
+	va_end(args);
+	diag_state = diag_buf;
+	diag_log("diag: %s\n", diag_buf);
 }
 
 /* ---- 自实现字符串函数 ---- */
@@ -183,120 +183,86 @@ static syscall_fn_t *find_sys_call_table(void)
 	return NULL;
 }
 
-/* ---- 遍历内核页表（TTBR1_EL1，ioremap 读表） ----
- * 返回: 1 = 4K PTE（*pte_out=PTE 值，*phys_out=页物理基址）
- *       0 = 2MB block（*pte_out=块描述符，*phys_out=含块内偏移的物理地址）
- *      -1 = 失败（diag_state 已给出具体原因） */
-static int walk_va(unsigned long va, u64 *pte_out, u64 *phys_out)
+/* ---- 页表 walk 报告：逐级读表项并打印，返回 phys 和类型，不做任何写入 ----
+ * 返回: 1 = 4K PTE，0 = 2MB block，-1 = 失败（各级表项已打印到 diag 文件） */
+static int walk_report(unsigned long va, const char *tag, u64 *phys_out)
 {
-	u64 ttbr1, e;
+	u64 ttbr1, l0_e = 0, l1_e = 0, l2_e = 0, l3_e = 0;
 	u64 *tbl;
+	int type = -1;
 
 	asm volatile("mrs %0, ttbr1_el1" : "=r"(ttbr1));
+	diag_log("[%s] va=%lx ttbr1=%llx\n", tag, va, ttbr1);
 
 	tbl = (u64 *)ioremap_cache(ttbr1 & PHYS_MASK & PAGE_MASK, PAGE_SIZE);
 	if (!tbl) {
-		diag_set("W-pgd-remap-fail");
+		diag_log("[%s] pgd remap FAIL\n", tag);
 		return -1;
 	}
-	e = tbl[pgd_index(va)];
+	l0_e = tbl[pgd_index(va)];
 	iounmap(tbl);
-	if ((e & 3) != 3) {
-		diag_set("W-pgd-bad=%llx", e);
+	diag_log("[%s] pgd[%lu]=%llx\n", tag, (unsigned long)pgd_index(va), l0_e);
+	if ((l0_e & 3) != 3) {
+		diag_log("[%s] pgd entry invalid\n", tag);
 		return -1;
 	}
 
 #if CONFIG_PGTABLE_LEVELS >= 4
-	tbl = (u64 *)ioremap_cache(e & PHYS_MASK & PAGE_MASK, PAGE_SIZE);
+	tbl = (u64 *)ioremap_cache(l0_e & PHYS_MASK & PAGE_MASK, PAGE_SIZE);
 	if (!tbl) {
-		diag_set("W-pud-remap-fail");
+		diag_log("[%s] pud remap FAIL\n", tag);
 		return -1;
 	}
-	e = tbl[pud_index(va)];
+	l1_e = tbl[pud_index(va)];
 	iounmap(tbl);
-	if ((e & 3) != 3) {
-		diag_set("W-pud-bad=%llx", e);
+	diag_log("[%s] pud[%lu]=%llx\n", tag, (unsigned long)pud_index(va), l1_e);
+	if ((l1_e & 3) != 3) {
+		diag_log("[%s] pud entry invalid\n", tag);
 		return -1;
 	}
+#else
+	l1_e = l0_e;
 #endif
 
-	tbl = (u64 *)ioremap_cache(e & PHYS_MASK & PAGE_MASK, PAGE_SIZE);
+	tbl = (u64 *)ioremap_cache(l1_e & PHYS_MASK & PAGE_MASK, PAGE_SIZE);
 	if (!tbl) {
-		diag_set("W-pmd-remap-fail");
+		diag_log("[%s] pmd remap FAIL\n", tag);
 		return -1;
 	}
-	e = tbl[pmd_index(va)];
+	l2_e = tbl[pmd_index(va)];
 	iounmap(tbl);
-	if ((e & 3) == 0) {
-		diag_set("W-pmd-none=%llx", e);
+	diag_log("[%s] pmd[%lu]=%llx\n", tag, (unsigned long)pmd_index(va), l2_e);
+	if ((l2_e & 3) == 0) {
+		diag_log("[%s] pmd entry NONE\n", tag);
 		return -1;
 	}
-	if ((e & 3) == 1) { /* 2MB block */
-		if (pte_out)
-			*pte_out = e;
-		if (phys_out)
-			*phys_out = (e & PHYS_MASK & ~((1UL << 21) - 1)) |
-				    (va & ((1UL << 21) - 1));
-		return 0;
+	if ((l2_e & 3) == 1) { /* 2MB block */
+		*phys_out = (l2_e & PHYS_MASK & ~((1UL << 21) - 1)) |
+			    (va & ((1UL << 21) - 1));
+		type = 0;
+		diag_log("[%s] pmd BLOCK phys=%llx\n", tag, *phys_out);
+		return type;
 	}
 
-	tbl = (u64 *)ioremap_cache(e & PHYS_MASK & PAGE_MASK, PAGE_SIZE);
+	tbl = (u64 *)ioremap_cache(l2_e & PHYS_MASK & PAGE_MASK, PAGE_SIZE);
 	if (!tbl) {
-		diag_set("W-pte-remap-fail");
+		diag_log("[%s] pte remap FAIL\n", tag);
 		return -1;
 	}
-	e = tbl[pte_index(va)];
+	l3_e = tbl[pte_index(va)];
 	iounmap(tbl);
-	if ((e & 3) == 0) {
-		diag_set("W-pte-none=%llx", e);
+	diag_log("[%s] pte[%lu]=%llx\n", tag, (unsigned long)pte_index(va), l3_e);
+	if ((l3_e & 3) == 0) {
+		diag_log("[%s] pte entry NONE\n", tag);
 		return -1;
 	}
-	if (pte_out)
-		*pte_out = e;
-	if (phys_out)
-		*phys_out = (e & PHYS_MASK & PAGE_MASK);
-	return 1;
+	*phys_out = l3_e & PHYS_MASK & PAGE_MASK;
+	type = 1;
+	diag_log("[%s] pte 4K phys=%llx\n", tag, *phys_out);
+	return type;
 }
 
-/* ---- 写入：ioremap 物理页别名（新 RW 映射），带写前读回预验证 ----
- * 下笔前先从新映射读回原值，必须等于 expect（sys_execve）才证明
- * phys 正确；否则绝不下笔 → 物理地址错误时不可能写坏内存。 */
-static int write_via_alias(unsigned long va, syscall_fn_t fn, syscall_fn_t expect)
-{
-	u64 pte = 0, phys = 0;
-	syscall_fn_t *t, orig;
-	void *m;
-	int r = walk_va(va, &pte, &phys);
-
-	if (r < 0)
-		return 0; /* walk 失败时 diag_state 已设置 */
-
-	diag_set("5a-walk-ok type=%d phys=%llx pte=%llx", r, phys, pte);
-	m = ioremap_cache(phys & PAGE_MASK, PAGE_SIZE);
-	if (!m) {
-		diag_set("5a-remap-fail phys=%llx", phys);
-		return 0;
-	}
-	t = (syscall_fn_t *)((char *)m + (va & (PAGE_SIZE - 1)));
-	orig = *t; /* 读回预验证 */
-	if (orig != expect) {
-		diag_set("5a-phys-mismatch got=%p want=%p phys=%llx",
-			 (void *)orig, (void *)expect, phys);
-		iounmap(m);
-		return 0;
-	}
-	WRITE_ONCE(*t, fn);
-	if (*t != fn) {
-		diag_set("5a-write-fail phys=%llx", phys);
-		iounmap(m);
-		return 0;
-	}
-	iounmap(m);
-	hook_method = (r == 0) ? "alias-block" : "alias-4k";
-	return 1;
-}
-
-/* ---- hook: arm64 syscall 表项签名 fn(const struct pt_regs *) ---- */
+/* ---- hook 函数（本版不安装，仅打印地址供下一版确认模块文本位置） ---- */
 static int diag_once;
 
 static long ksu_sys_execve(const struct pt_regs *regs)
@@ -337,11 +303,15 @@ static long ksu_sys_execve(const struct pt_regs *regs)
 static int ksu_hook_init(void)
 {
 	unsigned long se, el0;
-	int r;
+	u64 phys_sct = 0, phys_ex = 0;
+	int r1, r2;
 
 	diag_state = "1-init-running";
-	diag_log("=== ksu_sct init start ===\n");
+	diag_log("=== ksu_sct diag init start ===\n");
+	diag_log("build: PGTABLE_LEVELS=%d VA_BITS=%d\n",
+		 CONFIG_PGTABLE_LEVELS, CONFIG_ARM64_VA_BITS);
 	diag_log("ksu_path=%s\n", ksu_path ? ksu_path : "(null)");
+	diag_log("hook_fn=%ps\n", ksu_sys_execve);
 
 	sct = find_sys_call_table();
 	if (!sct) {
@@ -372,42 +342,44 @@ static int ksu_hook_init(void)
 	}
 	diag_state = "3-sct-verified";
 
-	/* 1) 首选：ioremap 物理页别名写（写前读回预验证，物理地址错则绝不下笔） */
-	r = write_via_alias((unsigned long)&sct[NR_EXECVE], ksu_sys_execve,
-			    orig_sys_execve);
-	if (r && sct[NR_EXECVE] == ksu_sys_execve) {
-		diag_log("HOOK OK via %s: sct[%d] -> %ps, trigger=%s\n",
-			 hook_method, NR_EXECVE, ksu_sys_execve, ksu_path);
-		diag_state = "5-hooked";
-		return 0;
+	/* ---- 诊断阶段：只 walk 只报告，不做任何内存写入 ---- */
+	diag_log("---- walk sct[%d] @ %p ----\n", NR_EXECVE, &sct[NR_EXECVE]);
+	r1 = walk_report((unsigned long)&sct[NR_EXECVE], "sct", &phys_sct);
+
+	diag_log("---- walk sys_execve @ %lx ----\n", se);
+	r2 = walk_report(se, "execve", &phys_ex);
+
+	if (r1 >= 0 && r2 >= 0) {
+		unsigned long va_diff =
+			(unsigned long)&sct[NR_EXECVE] - se;
+		u64 phys_diff = (phys_sct > phys_ex) ?
+				phys_sct - phys_ex : phys_ex - phys_sct;
+
+		diag_log("CROSS: va_diff=%lx phys_diff=%llx\n", va_diff, phys_diff);
+		if (va_diff == (unsigned long)phys_diff)
+			diag_set("R-ok sct=%llx(%d) ex=%llx(%d) diff=%lx match",
+				 phys_sct, r1, phys_ex, r2, va_diff);
+		else
+			diag_set("R-mismatch sct=%llx(%d) ex=%llx(%d) vd=%lx pd=%llx",
+				 phys_sct, r1, phys_ex, r2, va_diff, phys_diff);
+	} else {
+		diag_set("R-walk-fail r1=%d r2=%d", r1, r2);
 	}
 
-	/* 2) 别名路径失败：安全放弃，绝不再尝试任何写操作（防 panic）。
-	 *    diag_state 已给出具体原因（5a-* 或 W-*）。 */
-	if (r == 0)
-		return 0;
-
-	/* r==1 但原映射读回不一致：缓存/映射异常，报告即可 */
-	diag_set("5a-orig-verify-fail");
+	diag_log("=== diag done ===\n");
 	return 0;
 }
 
 static void ksu_sct_exit(void)
 {
-	if (sct && orig_sys_execve && sct[NR_EXECVE] == ksu_sys_execve)
-		WRITE_ONCE(sct[NR_EXECVE], orig_sys_execve);
 	diag_state = "9-exited";
-	diag_log("=== unhooked ===\n");
-	printk(KERN_INFO "ksu_sct: unhooked\n");
+	diag_log("=== exited ===\n");
 }
 
-/* 用标准 module_init/module_exit 宏：生成 .initcall6.init 段。
- * 实测直接定义 init_module() 不执行（v0.5/v0.6），怀疑 MTK 内核
- * 的模块 init 走 initcall 段而非标准 mod->init 路径。 */
 module_init(ksu_hook_init);
 module_exit(ksu_sct_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("DS");
-MODULE_DESCRIPTION("KSL root grant via sys_call_table execve hook (4.14 MT6771)");
-MODULE_VERSION("0.10");
+MODULE_DESCRIPTION("KSL diag-only LKM (sys_call_table walk report, MT6771 4.14)");
+MODULE_VERSION("0.11");
