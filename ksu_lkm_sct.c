@@ -1,5 +1,16 @@
 /*
- * ksu_lkm_sct.c — KSL 提权 LKM（sys_call_table hook 版）v0.15
+ * ksu_lkm_sct.c — KSL 提权 LKM（sys_call_table hook 版）v0.16
+ *
+ * v0.16（2026-08-04）：hook 函数去掉文件写（diag_log）。
+ *   v0.14 真机 panic 根因（反汇编 + 推理闭环）：v0.14 用线性偏移公式算
+ *   表页别名 → 垃圾 VA 写坏 vmalloc/ioremap 区内存（FAR=0xffffffcdf48b0000
+ *   正落在该区），首次 execve 进 hook 时访问模块数据撞上被写坏的映射 →
+ *   EL1 数据中止（翻译错误 level 3）。init 阶段大量访问模块全局数据全程
+ *   正常（重定位/映射无问题），hook 函数本身无辜。
+ *   v0.16 变更：
+ *   - hook 内不再调用 diag_log（filp_open/kernel_write 在 execve 热路径
+ *     有锁/睡眠/SELinux 风险）；诊断只靠 diag_state（内存写 + sysfs）
+ *   - 保留 v0.15 的 ioremap 表页补丁 + 内容预验证 + P1-P8 前置日志
  *
  * v0.15（2026-08-02）：表页补丁改用 ioremap + 内容预验证 + 前置日志。
  *   v0.14 真机 panic。根因（分析）：表页物理地址在 ~120GB 高位保留区
@@ -29,7 +40,6 @@
  *
  * MODULE_LICENSE("GPL") 必须：kallsyms_lookup_name 是 EXPORT_SYMBOL_GPL。
  */
-
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
@@ -521,7 +531,10 @@ static int write_via_linear(unsigned long va, syscall_fn_t fn,
 	return 0;
 }
 
-/* ---- hook: arm64 syscall 表项签名 fn(const struct pt_regs *) ---- */
+/* ---- hook: arm64 syscall 表项签名 fn(const struct pt_regs *) ----
+ * v0.16：热路径上不做任何文件写/睡眠操作（filp_open/kernel_write 有锁与
+ * SELinux 风险）；只更新 diag_state（模块内存 + sysfs 可读），诊断靠
+ * cat /sys/module/ksu_lkm_sct/parameters/diag_state。 */
 static int diag_once;
 
 static long ksu_sys_execve(const struct pt_regs *regs)
@@ -533,7 +546,6 @@ static long ksu_sys_execve(const struct pt_regs *regs)
 	if (!diag_once) {
 		diag_once = 1;
 		diag_state = "6-hook-called";
-		diag_log("hook called first time\n");
 	}
 
 	n = strncpy_from_user(buf, filename, sizeof(buf) - 1);
@@ -541,18 +553,15 @@ static long ksu_sys_execve(const struct pt_regs *regs)
 		buf[n] = 0;
 		if (k_strncmp(buf, ksu_path, k_strlen(ksu_path)) == 0 &&
 		    current_uid().val != 0) {
-			struct cred *new;
+			struct cred *nc;
 
 			diag_state = "7-matched";
-			diag_log("match! pid=%d uid=%d file=%s\n",
-				 current->pid, current_uid().val, buf);
-			new = p_prepare_kernel_cred(NULL);
-			if (new) {
-				p_commit_creds(new);
+			nc = p_prepare_kernel_cred(NULL);
+			if (nc) {
+				p_commit_creds(nc);
 				diag_state = "8-root-granted";
-				diag_log("root granted pid=%d\n", current->pid);
 			} else {
-				diag_log("prepare_kernel_cred NULL!\n");
+				diag_state = "7-prep-fail";
 			}
 		}
 	}
@@ -654,4 +663,4 @@ module_exit(ksu_sct_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("DS");
 MODULE_DESCRIPTION("KSL root grant via sct execve hook, ioremap table patch (MT6771 4.14)");
-MODULE_VERSION("0.15");
+MODULE_VERSION("0.16");
