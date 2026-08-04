@@ -1,5 +1,17 @@
 /*
- * ksu_lkm_sct.c — KSL 提权 LKM（sys_call_table hook 版）v0.17
+ * ksu_lkm_sct.c — KSL 提权 LKM（sys_call_table hook 版）v0.18
+ *
+ * v0.18（2026-08-04）：ppc/cc 符号解析改推算 + 防御。
+ *   真机 v0.17 实测：kallsyms_lookup_name("prepare_kernel_cred") 返回
+ *   0x3bd6e728、("commit_creds") 返回 0x25088d9e —— 用户空间垃圾值！
+ *   （el0_svc/sys_execve 等符号正常，仅这两个异常 → MTK kallsyms 表/查找
+ *   对该两符号有问题。）若直接用，提权时 blr 垃圾地址 → 死机。
+ *   修复：用 sys_execve（kallsyms 查询可靠）+ 同固件固定偏移推算：
+ *     prepare_kernel_cred = sys_execve - 0x19455c
+ *     commit_creds        = sys_execve - 0x194910
+ *   （偏移来自 2026-08-01 真机 kallsyms 记录；KASLR 整体平移不改变相对
+ *   偏移，同固件可靠；固件升级需重新标定。）
+ *   防御：推算值必须在内核地址空间（高 16 位 0xffff），否则不装 hook。
  *
  * v0.17（2026-08-04）：hook 签名修正 —— 4.14 arm64 syscall 表项是
  *   **用户参数直传**（SYSCALL_DEFINE 风格，x0=第一个参数），不是 fn(pt_regs)！
@@ -12,7 +24,8 @@
  *   旧签名 long hook(const struct pt_regs *) 把用户 pathname 当 pt_regs 指针，
  *   regs->regs[0] 即读用户地址 → 必死机。v0.14 的 +0x44 崩溃也是同一原因
  *   （读 [x0]），此前“垃圾 VA 写坏内存”的判断作废。
- *   v0.17 变更：hook 与 orig_sys_execve 改为 3 参直传签名。
+ *   v0.17 真机：hook 不再死机（diag_state=6-hook-called），写入路径完整
+ *   成功（5-hooked patched）—— 签名修复 + ioremap 写入方案双验证通过。
  *
  * v0.16（2026-08-04）：hook 函数去掉文件写（diag_log）。
  *   注：v0.16 的写入路径（ioremap 表页补丁）insmod 时未崩、hook 装上了
@@ -97,6 +110,14 @@ module_param_cb(ksu_trigger, &ksu_trigger_ops, &ksu_trigger, 0644);
 
 #define NR_EXECVE 221 /* arm64 */
 #define DIAG_FILE "/data/local/tmp/ksu_diag.txt"
+
+/* v0.18：MTK kallsyms 对 ppc/cc 直查返回垃圾 → 用 sys_execve 推算。
+ * 偏移来自 2026-08-01 真机 kallsyms：
+ *   prepare_kernel_cred = sys_execve - 0x19455c
+ *   commit_creds        = sys_execve - 0x194910
+ * KASLR 整体平移不改变相对偏移（同固件可靠；固件升级需重新标定）。 */
+#define KSL_OFF_PREPARE_KERNEL_CRED 0x19455cUL
+#define KSL_OFF_COMMIT_CREDS        0x194910UL
 
 /* 4.14 arm64：syscall 表项 = 用户参数直传（SYSCALL_DEFINE 风格，x0=第一个参数），
  * 不是 fn(struct pt_regs *)。arm64 从 4.17 才改 pt_regs 风格。 */
@@ -606,14 +627,30 @@ static int ksu_hook_init(void)
 
 	el0 = kallsyms_lookup_name("el0_svc");
 	se = kallsyms_lookup_name("sys_execve");
-	p_prepare_kernel_cred =
-		(prepare_kernel_cred_t)kallsyms_lookup_name("prepare_kernel_cred");
-	p_commit_creds = (commit_creds_t)kallsyms_lookup_name("commit_creds");
+	/* MTK 内核 kallsyms_lookup_name 对 prepare_kernel_cred/commit_creds 返回
+	 * 用户空间垃圾值（v0.17 真机实测 0x3bd6e728/0x25088d9e）。
+	 * 改用 sys_execve（查询可靠）+ 同固件固定偏移推算（KASLR 整体平移
+	 * 不改变相对偏移）。kl_* 仅作对照打印。 */
+	{
+		prepare_kernel_cred_t ppc_kl;
+		commit_creds_t cc_kl;
 
-	diag_log("kallsyms: el0_svc=%lx sys_execve=%lx ppc=%p cc=%p\n",
-		 el0, se, p_prepare_kernel_cred, p_commit_creds);
+		ppc_kl = (prepare_kernel_cred_t)kallsyms_lookup_name(
+			"prepare_kernel_cred");
+		cc_kl = (commit_creds_t)kallsyms_lookup_name("commit_creds");
+		p_prepare_kernel_cred = (prepare_kernel_cred_t)(se -
+				KSL_OFF_PREPARE_KERNEL_CRED);
+		p_commit_creds = (commit_creds_t)(se - KSL_OFF_COMMIT_CREDS);
 
-	if (!se || !p_prepare_kernel_cred || !p_commit_creds) {
+		diag_log("kallsyms: el0_svc=%lx sys_execve=%lx\n", el0, se);
+		diag_log("ppc: kl=%p calc=%p | cc: kl=%p calc=%p\n", ppc_kl,
+			 p_prepare_kernel_cred, cc_kl, p_commit_creds);
+	}
+
+	/* 防御：关键符号必须落在内核地址空间（高 16 位 0xffff） */
+	if (!se || ((unsigned long)se >> 48) != 0xffff ||
+	    ((unsigned long)p_prepare_kernel_cred >> 48) != 0xffff ||
+	    ((unsigned long)p_commit_creds >> 48) != 0xffff) {
 		diag_state = "2-kallsyms-fail";
 		return -ENOENT;
 	}
@@ -677,4 +714,4 @@ module_exit(ksu_sct_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("DS");
 MODULE_DESCRIPTION("KSL root grant via sct execve hook, ioremap table patch (MT6771 4.14)");
-MODULE_VERSION("0.17");
+MODULE_VERSION("0.18");
