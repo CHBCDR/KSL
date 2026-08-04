@@ -1,16 +1,23 @@
 /*
- * ksu_lkm_sct.c — KSL 提权 LKM（sys_call_table hook 版）v0.16
+ * ksu_lkm_sct.c — KSL 提权 LKM（sys_call_table hook 版）v0.17
+ *
+ * v0.17（2026-08-04）：hook 签名修正 —— 4.14 arm64 syscall 表项是
+ *   **用户参数直传**（SYSCALL_DEFINE 风格，x0=第一个参数），不是 fn(pt_regs)！
+ *   （arm64 从 4.17 才改成 pt_regs 风格。）
+ *   真机 pstore 铁证（v0.16）：
+ *     PC = ksu_sys_execve+0x40 = LDR x1,[x0]，x0 = 0x70cf207350（用户地址，
+ *     execve 的 pathname），x26=0xdd（221），x27=sys_call_table
+ *     “Internal error: Accessing user space memory outside uaccess.h routines”
+ *     → EL1 访问用户内存 → oops → die → exception reboot（死机）
+ *   旧签名 long hook(const struct pt_regs *) 把用户 pathname 当 pt_regs 指针，
+ *   regs->regs[0] 即读用户地址 → 必死机。v0.14 的 +0x44 崩溃也是同一原因
+ *   （读 [x0]），此前“垃圾 VA 写坏内存”的判断作废。
+ *   v0.17 变更：hook 与 orig_sys_execve 改为 3 参直传签名。
  *
  * v0.16（2026-08-04）：hook 函数去掉文件写（diag_log）。
- *   v0.14 真机 panic 根因（反汇编 + 推理闭环）：v0.14 用线性偏移公式算
- *   表页别名 → 垃圾 VA 写坏 vmalloc/ioremap 区内存（FAR=0xffffffcdf48b0000
- *   正落在该区），首次 execve 进 hook 时访问模块数据撞上被写坏的映射 →
- *   EL1 数据中止（翻译错误 level 3）。init 阶段大量访问模块全局数据全程
- *   正常（重定位/映射无问题），hook 函数本身无辜。
- *   v0.16 变更：
- *   - hook 内不再调用 diag_log（filp_open/kernel_write 在 execve 热路径
- *     有锁/睡眠/SELinux 风险）；诊断只靠 diag_state（内存写 + sysfs）
- *   - 保留 v0.15 的 ioremap 表页补丁 + 内容预验证 + P1-P8 前置日志
+ *   注：v0.16 的写入路径（ioremap 表页补丁）insmod 时未崩、hook 装上了
+ *   （pstore 显示 insmod 成功、bash 下一条 execve 才死机）——写入方案本身
+ *   真机成立。
  *
  * v0.15（2026-08-02）：表页补丁改用 ioremap + 内容预验证 + 前置日志。
  *   v0.14 真机 panic。根因（分析）：表页物理地址在 ~120GB 高位保留区
@@ -91,7 +98,11 @@ module_param_cb(ksu_trigger, &ksu_trigger_ops, &ksu_trigger, 0644);
 #define NR_EXECVE 221 /* arm64 */
 #define DIAG_FILE "/data/local/tmp/ksu_diag.txt"
 
-typedef long (*syscall_fn_t)(const struct pt_regs *);
+/* 4.14 arm64：syscall 表项 = 用户参数直传（SYSCALL_DEFINE 风格，x0=第一个参数），
+ * 不是 fn(struct pt_regs *)。arm64 从 4.17 才改 pt_regs 风格。 */
+typedef long (*syscall_fn_t)(const char __user *filename,
+			     const char __user *const __user *argv,
+			     const char __user *const __user *envp);
 typedef struct cred *(*prepare_kernel_cred_t)(struct task_struct *);
 typedef int (*commit_creds_t)(struct cred *);
 
@@ -531,15 +542,18 @@ static int write_via_linear(unsigned long va, syscall_fn_t fn,
 	return 0;
 }
 
-/* ---- hook: arm64 syscall 表项签名 fn(const struct pt_regs *) ----
- * v0.16：热路径上不做任何文件写/睡眠操作（filp_open/kernel_write 有锁与
- * SELinux 风险）；只更新 diag_state（模块内存 + sysfs 可读），诊断靠
- * cat /sys/module/ksu_lkm_sct/parameters/diag_state。 */
+/* ---- hook: 4.14 arm64 syscall 表项签名（用户参数直传） ----
+ * v0.17：签名改为 SYSCALL_DEFINE 风格（filename, argv, envp）——
+ * 4.14 arm64 调用表项时 x0=第一个系统调用参数，不是 pt_regs。
+ * v0.16 死机根因：旧签名把用户 pathname 当 pt_regs → 读用户地址 →
+ * EL1 访问用户内存（PAN）→ oops → die → exception reboot。
+ * 热路径上不做文件写/睡眠操作，诊断只靠 diag_state。 */
 static int diag_once;
 
-static long ksu_sys_execve(const struct pt_regs *regs)
+static long ksu_sys_execve(const char __user *filename,
+			   const char __user *const __user *argv,
+			   const char __user *const __user *envp)
 {
-	const char __user *filename = (const char __user *)regs->regs[0];
 	char buf[256];
 	long n;
 
@@ -565,7 +579,7 @@ static long ksu_sys_execve(const struct pt_regs *regs)
 			}
 		}
 	}
-	return orig_sys_execve(regs);
+	return orig_sys_execve(filename, argv, envp);
 }
 
 static int ksu_hook_init(void)
@@ -663,4 +677,4 @@ module_exit(ksu_sct_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("DS");
 MODULE_DESCRIPTION("KSL root grant via sct execve hook, ioremap table patch (MT6771 4.14)");
-MODULE_VERSION("0.16");
+MODULE_VERSION("0.17");
