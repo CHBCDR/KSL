@@ -7,7 +7,7 @@
 > 🎯 **项目定位（2026-08-02 定稿）**：不追求复刻 KernelSU——闭源内核上本质不可能（无源码打补丁、无 GKI、KPROBES=n、eBPF 只能看不能改、FUNCTION_TRACER 未启用）。
 > 目标是自研 **KSU-like** 最小内核授权：LKM 加载 + 内核态提权 + 轻量 su 接口。**验收标准是"机制能跑"，不是"像 KSU"。** 不做 Manager app / overlayfs / 模块管理。
 
-**当前主力：`ksu_lkm_sct.c` v0.19** —— sys_call_table hook 版，**真机全链路验证通过（含用户态 uid=0 输出）**。
+**当前主力：`ksu_lkm_sct.c` v0.20** —— sys_call_table hook 版，**真机全链路验证通过（含用户态 uid=0 输出）**，附带轻量 su 前端 `ksu_su.c`。
 
 ## ✅ 当前状态（2026-08-05）
 
@@ -38,6 +38,7 @@ uid=0(root) gid=0(root) groups=0(root) context=u:r:magisk:s0
 | v0.17 | 签名修正（4.14 arm64 syscall 表项 = 用户参数直传，非 fn(pt_regs)） | ✅ 不再死机 |
 | v0.18 | ppc/cc 用 sys_execve + 同固件偏移推算 + 地址防御；重启后复现；修正 %p hash 认知 | ✅ 内核态提权 |
 | **v0.19** | **prepare_creds() 只改 uid/gid/caps，保留 SELinux 域**（v0.18 的 kernel:s0 域导致提权后不可用） | ✅ **全链路闭环** |
+| v0.20 | `ksu_uids` uid 白名单参数（默认空=不限制，无回归）；新增 `ksu_su.c` 轻量 su 前端 | ✅ 预检通过 |
 
 ## sys_call_table hook 版原理（v0.19 现行）
 
@@ -91,6 +92,14 @@ su 2000 -c /data/local/tmp/ksu
 
 su -c 'cat /sys/module/ksu_lkm_sct/parameters/diag_state'   # 期望 8-root-granted
 su -c 'tail -5 /data/local/tmp/ksu_diag.txt'                # 符号地址应全部 0xffffff...（%px）
+
+# 轻量 su 接口（ksu_su 在 artifact 里，arm64 static）：任意命令以 root 跑
+su 2000 -c '/data/local/tmp/ksu_su id'                      # 期望 uid=0(root) ...
+su 2000 -c '/data/local/tmp/ksu_su cat /proc/version'       # 任意命令
+su 2000 -c /data/local/tmp/ksu_su                           # 交互 shell
+
+# uid 白名单（可选）：只允许 uid 2000 提权，其他 uid 直接拒绝
+su -c 'rmmod ksu_lkm_sct && insmod /data/local/tmp/ksu_lkm_sct.ko ksu_path=/data/local/tmp/ksu ksu_uids=2000 ksu_trigger=1'
 ```
 
 卸载：`su -c 'rmmod ksu_lkm_sct'`
@@ -110,9 +119,9 @@ su -c 'tail -5 /data/local/tmp/ksu_diag.txt'                # 符号地址应全
 
 ## 已知限制 / TODO
 
-- 触发方式 = 路径前缀白名单（`ksu_path`），**文件不存在也提权**（hook 在 orig 之前完成 cred 替换，与文件内容无关）——设计如此，后续可加 uid/comm 白名单收紧
+- 触发方式 = 路径前缀白名单（`ksu_path`），**文件不存在也提权**（hook 在 orig 之前完成 cred 替换，与文件内容无关）——v0.20 已加 `ksu_uids` uid 白名单参数（默认空=全部，行为不变）
 - 提权保留调用者 SELinux 域（magisk/shell），不是 KSU 的完整域切换；如需 system 域级别能力需另行 hook selinux 检查
-- 轻量 su 接口（userspace 前端）未做——内核授权已就位，补个壳就是完整方案
+- ✅ 轻量 su 接口已实现：`ksu_su.c`（NDK clang arm64 static，随 workflow 一起编译，artifact 含 ksu_su）
 - 偏移推算依赖同固件（固件升级需重新标定 prepare_creds/commit_creds）
 
 ## 验证记录
@@ -121,4 +130,4 @@ su -c 'tail -5 /data/local/tmp/ksu_diag.txt'                # 符号地址应全
 - 2026-08-01：tracepoint 版加载失败，实锤 `__tracepoint_sched_process_exec` 未导出 → 弃用；kload v2（finit_module flags）确认生效；写出 ksu_lkm_sct.c 并通过 Godbolt 预检
 - 2026-08-02：v0.8~v0.15 真机排障（hook 死机、写入 panic），pstore 全程取证
 - 2026-08-04：v0.16 签名根因定位（pstore 铁证）；v0.17 不再死机、写入路径跑通；v0.18 提权复现（8-root-granted ×2）
-- 2026-08-05：v0.18 修正认知（%p hash、kernel:s0 域锁死用户态）；**v0.19 prepare_creds 保留域 → 首次用户态 uid=0 输出，全链路闭环**
+- 2026-08-05：v0.18 修正认知（%p hash、kernel:s0 域锁死用户态）；**v0.19 prepare_creds 保留域 → 首次用户态 uid=0 输出，全链路闭环**；v0.20 加 ksu_uids 白名单 + ksu_su 轻量 su 前端

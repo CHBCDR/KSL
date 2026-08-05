@@ -80,6 +80,11 @@ static char *ksu_path = "/data/local/tmp/ksu";
 module_param(ksu_path, charp, 0644);
 MODULE_PARM_DESC(ksu_path, "exec path prefix that triggers root grant");
 
+/* v0.20: uid whitelist, comma-separated ("2000,10105"); empty = any uid */
+static char *ksu_uids = "";
+module_param(ksu_uids, charp, 0644);
+MODULE_PARM_DESC(ksu_uids, "comma-separated uid whitelist for root grant; empty = any non-root uid");
+
 /* 状态标记：init/hook 每步更新，cat /sys/module/ksu_lkm_sct/parameters/diag_state 查看 */
 static char *diag_state = "0-init-not-run";
 module_param(diag_state, charp, 0444);
@@ -109,6 +114,10 @@ static const struct kernel_param_ops ksu_trigger_ops = {
 
 module_param_cb(ksu_trigger, &ksu_trigger_ops, &ksu_trigger, 0644);
 
+/* v0.20 (2026-08-05): optional uid whitelist via ksu_uids module param.
+ * Default empty = grant any non-root uid (v0.19 behavior unchanged, no
+ * regression). Set e.g. ksu_uids=2000 to only grant uid 2000 (shell).
+ */
 /* v0.19 (2026-08-05): fix SELinux domain breakage from v0.18.
  * v0.18 used prepare_kernel_cred(NULL) -> cred carries kernel:s0 domain,
  * SELinux denied terminal writes / file access after commit_creds
@@ -200,6 +209,33 @@ static int k_strncmp(const char *a, const char *b, size_t n)
 		if (!a[i])
 			return 0;
 	}
+	return 0;
+}
+
+/* v0.20: uid whitelist check (ksu_uids, comma-separated; empty = allow all) */
+static int ksu_uid_allowed(unsigned int uid)
+{
+	const char *p = ksu_uids;
+	unsigned long v = 0;
+	int have = 0;
+
+	if (!p || !p[0])
+		return 1;
+
+	while (*p) {
+		if (*p >= '0' && *p <= '9') {
+			v = v * 10 + (unsigned long)(*p - '0');
+			have = 1;
+		} else if (*p == ',') {
+			if (have && v == uid)
+				return 1;
+			v = 0;
+			have = 0;
+		}
+		p++;
+	}
+	if (have && v == uid)
+		return 1;
 	return 0;
 }
 
@@ -598,7 +634,8 @@ static long ksu_sys_execve(const char __user *filename,
 	if (n > 0) {
 		buf[n] = 0;
 		if (k_strncmp(buf, ksu_path, k_strlen(ksu_path)) == 0 &&
-		    current_uid().val != 0) {
+		    current_uid().val != 0 &&
+		    ksu_uid_allowed(current_uid().val)) {
 			struct cred *nc;
 
 			diag_state = "7-matched";
