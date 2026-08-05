@@ -1,20 +1,22 @@
 # KSU-like LKM — MT6771 (4.14.141) 闭源内核 Root 授权模块
 
-旧仓库：[https://github.com/CHBCDR/ksu-lkm](https://github.com/CHBCDR/ksu-lkm)（已弃用，2026-08-02 改名 CHBCDR/KSL）
+旧仓库：[https://github.com/CHBCDR/ksu-lkm]   （已弃用，2026-08-02 改名为KSL）
 
 由 DeepSeek V4 Flash 编写
 
 > 🎯 **项目定位（2026-08-02 定稿）**：不追求复刻 KernelSU——闭源内核上本质不可能（无源码打补丁、无 GKI、KPROBES=n、eBPF 只能看不能改、FUNCTION_TRACER 未启用）。
 > 目标是自研 **KSU-like** 最小内核授权：LKM 加载 + 内核态提权 + 轻量 su 接口。**验收标准是"机制能跑"，不是"像 KSU"。** 不做 Manager app / overlayfs / 模块管理。
 
+**项目初衷**：设备是闭源小厂魔改内核（MT6771/4.14.141），真 KernelSU 三条路全堵死（无源码可补丁、无 GKI、KPROBES=n / FUNCTION_TRACER=n / eBPF 只能看不能改）。Magisk 的 root 授权在用户态守护进程（magiskd）完成，内核只是被动提权工具。KSL 把"谁能拿 root"的决定权放回内核：**内核态授权**（sys_call_table hook + commit_creds），userspace 仅做请求（轻量 su），不依赖任何守护进程。
+
 **当前主力：`ksu_lkm_sct.c` v0.20** —— sys_call_table hook 版，**真机全链路验证通过（含用户态 uid=0 输出）**，附带轻量 su 前端 `ksu_su.c`。
 
-## ✅ 当前状态（2026-08-05）
+## ✅ 当前状态（2026-08-05，v0.20 真机全链路验证）
 
-v0.19 真机闭环：非 root 进程（uid 2000）execve 前缀命中 `/data/local/tmp/ksu` → 内核 hook 提权（uid/gid=0 + 全 caps）→ **保留调用者 SELinux 域** → 用户态完全可用：
+非 root 进程（uid 2000）execve 前缀命中 ksu 路径 → 内核 hook 提权（uid/gid=0 + 全 caps）→ **保留调用者 SELinux 域** → 用户态完全可用：
 
 ```
-su 2000 -c /data/local/tmp/ksu
+su 2000 -c '/data/local/tmp/ksu_su id'
 uid=0(root) gid=0(root) groups=0(root) context=u:r:magisk:s0
 ```
 
@@ -24,8 +26,10 @@ uid=0(root) gid=0(root) groups=0(root) context=u:r:magisk:s0
 | hook 签名（4.14 arm64 用户参数直传） | ✅ 无死机 |
 | 符号解析（偏移推算 + 0xffff 防御） | ✅ |
 | 内核态提权 | ✅ |
-| 用户态 uid=0 输出 | ✅ 首次（v0.19） |
-| SELinux 域保留 | ✅ magisk:s0（v0.19 修复） |
+| 用户态 uid=0 输出 | ✅ v0.19 首次，v0.20 复现 |
+| SELinux 域保留 | ✅ magisk:s0 / shell 域 |
+| **uid 白名单（ksu_uids）** | ✅ 放行 2000、拒绝 10105 |
+| **轻量 su 接口（ksu_su）** | ✅ 任意命令 / 交互 shell |
 
 ## 版本史
 
@@ -38,9 +42,9 @@ uid=0(root) gid=0(root) groups=0(root) context=u:r:magisk:s0
 | v0.17 | 签名修正（4.14 arm64 syscall 表项 = 用户参数直传，非 fn(pt_regs)） | ✅ 不再死机 |
 | v0.18 | ppc/cc 用 sys_execve + 同固件偏移推算 + 地址防御；重启后复现；修正 %p hash 认知 | ✅ 内核态提权 |
 | **v0.19** | **prepare_creds() 只改 uid/gid/caps，保留 SELinux 域**（v0.18 的 kernel:s0 域导致提权后不可用） | ✅ **全链路闭环** |
-| v0.20 | `ksu_uids` uid 白名单参数（默认空=不限制，无回归）；新增 `ksu_su.c` 轻量 su 前端 | ✅ 预检通过 |
+| v0.20 | `ksu_uids` uid 白名单参数（默认空=不限制，无回归）；新增 `ksu_su.c` 轻量 su 前端 | ✅ **真机验证通过** |
 
-## sys_call_table hook 版原理（v0.19 现行）
+## sys_call_table hook 版原理（v0.20 现行）
 
 - `kallsyms_lookup_name("el0_svc")` 拿异常入口，反汇编 `adrp x27, <page>` 解析出 `sys_call_table` 地址（KALLSYMS_ALL=n 时数据符号不在 kallsyms，只能这样拿）
 - 校验 `sct[221] == kallsyms_lookup_name("sys_execve")`，地址错即 abort，绝不盲写
@@ -69,7 +73,7 @@ uid=0(root) gid=0(root) groups=0(root) context=u:r:magisk:s0
 
 本地预检（交付前必跑）：`powershell -ExecutionPolicy Bypass -File precheck/godbolt-precheck.ps1`（Godbolt ARM64 GCC -Werror 语法检查）。
 
-## 设备端部署测试（v0.19 验证流程）
+## 设备端部署测试（v0.20 验证流程）
 
 ```sh
 adb push ksu_lkm_sct.ko /data/local/tmp/
@@ -130,4 +134,4 @@ su -c 'rmmod ksu_lkm_sct && insmod /data/local/tmp/ksu_lkm_sct.ko ksu_path=/data
 - 2026-08-01：tracepoint 版加载失败，实锤 `__tracepoint_sched_process_exec` 未导出 → 弃用；kload v2（finit_module flags）确认生效；写出 ksu_lkm_sct.c 并通过 Godbolt 预检
 - 2026-08-02：v0.8~v0.15 真机排障（hook 死机、写入 panic），pstore 全程取证
 - 2026-08-04：v0.16 签名根因定位（pstore 铁证）；v0.17 不再死机、写入路径跑通；v0.18 提权复现（8-root-granted ×2）
-- 2026-08-05：v0.18 修正认知（%p hash、kernel:s0 域锁死用户态）；**v0.19 prepare_creds 保留域 → 首次用户态 uid=0 输出，全链路闭环**；v0.20 加 ksu_uids 白名单 + ksu_su 轻量 su 前端
+- 2026-08-05：v0.18 修正认知（%p hash、kernel:s0 域锁死用户态）；**v0.19 prepare_creds 保留域 → 首次用户态 uid=0 输出，全链路闭环**；v0.20 加 ksu_uids 白名单 + ksu_su 轻量 su 前端，**真机验证：uid=0 提权、白名单放行 2000/拒绝 10105、ksu_su 跑通**；普通 shell（$）环境提权验证：uid=0 + 保留 shell 域（SELinux 限制仍在，与 KernelSU 行为一致）
