@@ -2,7 +2,7 @@
 
 旧仓库：[https://github.com/CHBCDR/ksu-lkm]   （已弃用，2026-08-02 改名为KSL）
 
-由 DeepSeek V4 Flash 编写
+此说明由 DeepSeek V4 Flash 编写
 
 > 🎯 **项目定位（2026-08-02 定稿）**：不追求复刻 KernelSU——闭源内核上本质不可能（无源码打补丁、无 GKI、KPROBES=n、eBPF 只能看不能改、FUNCTION_TRACER 未启用）。
 > 目标是自研 **KSU-like** 最小内核授权：LKM 加载 + 内核态提权 + 轻量 su 接口。**验收标准是"机制能跑"，不是"像 KSU"。** 不做 Manager app / overlayfs / 模块管理。
