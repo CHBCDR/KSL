@@ -139,3 +139,5 @@ su -c 'rmmod ksu_lkm_sct && insmod /data/local/tmp/ksu_lkm_sct.ko ksu_path=/data
 - 2026-08-02：v0.8~v0.15 真机排障（hook 死机、写入 panic），pstore 全程取证
 - 2026-08-04：v0.16 签名根因定位（pstore 铁证）；v0.17 不再死机、写入路径跑通；v0.18 提权复现（8-root-granted ×2）
 - 2026-08-05：v0.18 修正认知（%p hash、kernel:s0 域锁死用户态）；**v0.19 prepare_creds 保留域 → 首次用户态 uid=0 输出，全链路闭环**；v0.20 加 ksu_uids 白名单 + ksu_su 轻量 su 前端，**真机验证：uid=0 提权、白名单放行 2000/拒绝 10105、ksu_su 跑通**；普通 shell（$）环境提权验证：uid=0 + 保留 shell 域（SELinux 限制仍在，与 KernelSU 行为一致）
+
+Copyright (C) 2026 CHBCDR
