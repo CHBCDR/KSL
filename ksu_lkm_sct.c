@@ -65,6 +65,7 @@
 #include <linux/init.h>
 #include <linux/kallsyms.h>
 #include <linux/cred.h>
+#include <linux/uidgid.h>
 #include <linux/sched.h>
 #include <linux/capability.h>
 #include <linux/uaccess.h>
@@ -108,6 +109,16 @@ static const struct kernel_param_ops ksu_trigger_ops = {
 
 module_param_cb(ksu_trigger, &ksu_trigger_ops, &ksu_trigger, 0644);
 
+/* v0.19 (2026-08-05): fix SELinux domain breakage from v0.18.
+ * v0.18 used prepare_kernel_cred(NULL) -> cred carries kernel:s0 domain,
+ * SELinux denied terminal writes / file access after commit_creds
+ * (avc denied, scontext=u:r:kernel:s0, comm=sh) -> "8-root-granted" but
+ * the process could not run (exit 1, no output). Root never usable.
+ * v0.19: use prepare_creds() and only change uid/gid/caps, keep the
+ * caller's SELinux domain. Offsets re-calibrated on device 2026-08-05:
+ *   prepare_creds = sys_execve - 0x194cb4
+ *   commit_creds  = sys_execve - 0x194910 (unchanged)
+ */
 #define NR_EXECVE 221 /* arm64 */
 #define DIAG_FILE "/data/local/tmp/ksu_diag.txt"
 
@@ -116,7 +127,7 @@ module_param_cb(ksu_trigger, &ksu_trigger_ops, &ksu_trigger, 0644);
  *   prepare_kernel_cred = sys_execve - 0x19455c
  *   commit_creds        = sys_execve - 0x194910
  * KASLR 整体平移不改变相对偏移（同固件可靠；固件升级需重新标定）。 */
-#define KSL_OFF_PREPARE_KERNEL_CRED 0x19455cUL
+#define KSL_OFF_PREPARE_CREDS       0x194cb4UL
 #define KSL_OFF_COMMIT_CREDS        0x194910UL
 
 /* 4.14 arm64：syscall 表项 = 用户参数直传（SYSCALL_DEFINE 风格，x0=第一个参数），
@@ -124,11 +135,11 @@ module_param_cb(ksu_trigger, &ksu_trigger_ops, &ksu_trigger, 0644);
 typedef long (*syscall_fn_t)(const char __user *filename,
 			     const char __user *const __user *argv,
 			     const char __user *const __user *envp);
-typedef struct cred *(*prepare_kernel_cred_t)(struct task_struct *);
+typedef struct cred *(*prepare_creds_t)(void);
 typedef int (*commit_creds_t)(struct cred *);
 
 static syscall_fn_t orig_sys_execve;
-static prepare_kernel_cred_t p_prepare_kernel_cred;
+static prepare_creds_t p_prepare_creds;
 static commit_creds_t p_commit_creds;
 static syscall_fn_t *sct; /* sys_call_table */
 
@@ -591,8 +602,19 @@ static long ksu_sys_execve(const char __user *filename,
 			struct cred *nc;
 
 			diag_state = "7-matched";
-			nc = p_prepare_kernel_cred(NULL);
+			nc = p_prepare_creds();
 			if (nc) {
+				/* v0.19: only change uid/gid/caps, keep caller's
+				 * SELinux domain (prepare_kernel_cred would carry
+				 * kernel:s0 -> terminal writes denied). */
+				nc->uid = nc->euid = nc->suid = nc->fsuid =
+					GLOBAL_ROOT_UID;
+				nc->gid = nc->egid = nc->sgid = nc->fsgid =
+					GLOBAL_ROOT_GID;
+				nc->cap_effective = CAP_FULL_SET;
+				nc->cap_permitted = CAP_FULL_SET;
+				nc->cap_inheritable = CAP_FULL_SET;
+				nc->cap_bset = CAP_FULL_SET;
 				p_commit_creds(nc);
 				diag_state = "8-root-granted";
 			} else {
@@ -632,24 +654,27 @@ static int ksu_hook_init(void)
 	 * 改用 sys_execve（查询可靠）+ 同固件固定偏移推算（KASLR 整体平移
 	 * 不改变相对偏移）。kl_* 仅作对照打印。 */
 	{
-		prepare_kernel_cred_t ppc_kl;
+		prepare_creds_t pc_kl;
 		commit_creds_t cc_kl;
 
-		ppc_kl = (prepare_kernel_cred_t)kallsyms_lookup_name(
-			"prepare_kernel_cred");
+		/* reference: direct lookup (%px prints raw value; MTK %p is hashed) */
+		pc_kl = (prepare_creds_t)kallsyms_lookup_name("prepare_creds");
 		cc_kl = (commit_creds_t)kallsyms_lookup_name("commit_creds");
-		p_prepare_kernel_cred = (prepare_kernel_cred_t)(se -
-				KSL_OFF_PREPARE_KERNEL_CRED);
+		/* calibrated on device 2026-08-05 (same firmware, offsets fixed):
+		 *   prepare_creds = sys_execve - 0x194cb4
+		 *   commit_creds  = sys_execve - 0x194910 */
+		p_prepare_creds = (prepare_creds_t)(se -
+				KSL_OFF_PREPARE_CREDS);
 		p_commit_creds = (commit_creds_t)(se - KSL_OFF_COMMIT_CREDS);
 
 		diag_log("kallsyms: el0_svc=%lx sys_execve=%lx\n", el0, se);
-		diag_log("ppc: kl=%p calc=%p | cc: kl=%p calc=%p\n", ppc_kl,
-			 p_prepare_kernel_cred, cc_kl, p_commit_creds);
+		diag_log("pc: kl=%px calc=%px | cc: kl=%px calc=%px\n", pc_kl,
+			 (void *)p_prepare_creds, cc_kl, (void *)p_commit_creds);
 	}
 
 	/* 防御：关键符号必须落在内核地址空间（高 16 位 0xffff） */
 	if (!se || ((unsigned long)se >> 48) != 0xffff ||
-	    ((unsigned long)p_prepare_kernel_cred >> 48) != 0xffff ||
+	    ((unsigned long)p_prepare_creds >> 48) != 0xffff ||
 	    ((unsigned long)p_commit_creds >> 48) != 0xffff) {
 		diag_state = "2-kallsyms-fail";
 		return -ENOENT;
