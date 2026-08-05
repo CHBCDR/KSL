@@ -72,6 +72,13 @@ jobs:
             $GITHUB_WORKSPACE/kload.c -o kload
           file kload || true
 
+      - name: Build ksu_su (lightweight su frontend, arm64 static)
+        run: |
+          export PATH=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
+          clang --target=aarch64-linux-android21 -static -O2 \
+            $GITHUB_WORKSPACE/ksu_su.c -o ksu_su
+          file ksu_su || true
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -79,4 +86,5 @@ jobs:
           path: |
             *.ko
             kload
+            ksu_su
           if-no-files-found: error
